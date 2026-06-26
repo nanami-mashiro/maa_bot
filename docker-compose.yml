@@ -1,0 +1,63 @@
+services:
+  redroid:
+    image: redroid/redroid:12.0.0-latest
+    privileged: true
+    restart: unless-stopped
+    ports:
+      - "5555:5555"
+    volumes:
+      - redroid-data:/data
+    command:
+      - androidboot.redroid_width=1280
+      - androidboot.redroid_height=720
+      - androidboot.redroid_dpi=240
+
+  maa-bot:
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - redroid
+    environment:
+      MAA_TG_CONFIG: /app/config/bot.toml
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:?set TELEGRAM_ALLOWED_USER_IDS in .env}
+      TZ: ${TZ:-Asia/Shanghai}
+      HTTP_PROXY: http://127.0.0.1:7890
+      HTTPS_PROXY: http://127.0.0.1:7890
+      ALL_PROXY: http://127.0.0.1:7890
+      ADB_CONNECT_HOST: 127.0.0.1:5555
+      ADB_SERIAL: 127.0.0.1:5555
+      ARKNIGHTS_LOGIN_ENABLED: ${ARKNIGHTS_LOGIN_ENABLED:-}
+      ARKNIGHTS_LOGIN_USERNAME: ${ARKNIGHTS_LOGIN_USERNAME:-}
+      ARKNIGHTS_LOGIN_PASSWORD: ${ARKNIGHTS_LOGIN_PASSWORD:-}
+      MAA_STARTUP_RETRIES: ${MAA_STARTUP_RETRIES:-}
+      CLIENT_UPDATE_ENABLED: ${CLIENT_UPDATE_ENABLED:-}
+      CLIENT_UPDATE_DOWNLOAD_URL: ${CLIENT_UPDATE_DOWNLOAD_URL:-}
+      CLIENT_UPDATE_DOWNLOAD_TIMEOUT_SECONDS: ${CLIENT_UPDATE_DOWNLOAD_TIMEOUT_SECONDS:-}
+      CLIENT_UPDATE_INSTALL_TIMEOUT_SECONDS: ${CLIENT_UPDATE_INSTALL_TIMEOUT_SECONDS:-}
+      MAA_CORE_UPDATE_ENABLED: ${MAA_CORE_UPDATE_ENABLED:-true}
+      MAA_CORE_UPDATE_CHANNEL: ${MAA_CORE_UPDATE_CHANNEL:-stable}
+      MAA_CORE_UPDATE_INTERVAL_SECONDS: ${MAA_CORE_UPDATE_INTERVAL_SECONDS:-21600}
+      MAA_CORE_UPDATE_TIMEOUT_SECONDS: ${MAA_CORE_UPDATE_TIMEOUT_SECONDS:-1800}
+      MAA_CORE_UPDATE_TEST_TIME: ${MAA_CORE_UPDATE_TEST_TIME:-0}
+      SCHEDULE_ENABLED: ${SCHEDULE_ENABLED:-}
+      SCHEDULE_DAILY_TIMES: ${SCHEDULE_DAILY_TIMES:-}
+      SCHEDULE_TIMEZONE: ${SCHEDULE_TIMEZONE:-}
+      SCHEDULE_NOTIFY_CHAT_ID: ${SCHEDULE_NOTIFY_CHAT_ID:-}
+      MAA_CONFIG_DIR: /data/maa-config
+      BOT_LOG_DIR: /data/logs
+    volumes:
+      - ./maa_tg_bot:/app/maa_tg_bot:ro
+      - ./config:/app/config:ro
+      - /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime:ro
+      - ./config/timezone:/etc/timezone:ro
+      - maa-data:/root/.local/share/maa
+      - maa-config:/data/maa-config
+      - bot-logs:/data/logs
+
+volumes:
+  redroid-data:
+  maa-data:
+  maa-config:
+  bot-logs:

@@ -1,0 +1,126 @@
+[bot]
+log_dir = "/data/logs"
+queue_size = 20
+
+[schedule]
+enabled = false
+# Runtime daily times are set with /setschedule and stored in SQLite.
+# This value is a fallback for old or empty runtime state.
+daily_times = ["08:00", "20:00"]
+timezone = "Asia/Shanghai"
+# Required when schedule.enabled = true.
+# notify_chat_id = 123456789
+
+[maa]
+bin = "maa"
+config_dir = "/data/maa-config"
+profile = "default"
+task_timeout_seconds = 7200
+client_type = "Official"
+account_name = ""
+server = "CN"
+auto_startup = true
+auto_closedown = false
+# MAA StartUp is retried after force-stopping the game when it fails.
+startup_retries = 3
+log_level = "info"
+
+[client_update]
+# When StartUp fails with a likely outdated client, download and install the official APK.
+enabled = true
+download_url = "https://ak.hypergryph.com/downloads/android_lastest"
+download_timeout_seconds = 1800
+install_timeout_seconds = 600
+
+[maa_update]
+# Silently update MaaCore and bundled resources before queued MAA tasks.
+enabled = true
+channel = "stable"
+interval_seconds = 21600
+timeout_seconds = 1800
+test_time = 0
+
+[android]
+adb_bin = "adb"
+adb_serial = "redroid:5555"
+adb_connect_host = "redroid:5555"
+screenshot_timeout_seconds = 30
+
+[login]
+enabled = false
+package_name = "com.hypergryph.arknights"
+login_timeout_seconds = 180
+
+[fight]
+# Set the runtime default stage with /setstage. It is stored in SQLite.
+# This legacy file value is only a fallback for old deployments.
+stage = ""
+medicine = 0
+expiring_medicine = 0
+stone = 0
+# times omitted means MAA default behavior.
+series = 0
+dr_grandet = false
+
+[base]
+mode = 0
+facility = ["Mfg", "Trade", "Reception", "Control", "Power", "Office", "Dorm"]
+# For a custom infrast plan, put the JSON file under $MAA_CONFIG_DIR/infrast
+# and set mode = 10000, filename = "normal.json".
+filename = ""
+# plan_index = 0
+drones = "_NotUse"
+threshold = 0.3
+replenish = false
+dorm_notstationed_enabled = false
+dorm_trust_enabled = false
+reception_message_board = true
+reception_clue_exchange = true
+reception_send_clue = true
+
+# Example time based plan selection:
+# [[base.variants]]
+# condition = { type = "Time", start = "18:00:00", end = "04:00:00" }
+# params = { plan_index = 0 }
+#
+# [[base.variants]]
+# condition = { type = "Time", end = "12:00:00" }
+# params = { plan_index = 1 }
+#
+# [[base.variants]]
+# condition = { type = "Time", start = "12:00:00" }
+# params = { plan_index = 2 }
+
+[mall]
+visit_friends = true
+shopping = true
+buy_first = []
+blacklist = []
+force_shopping_if_credit_full = false
+only_buy_discount = false
+reserve_max_credit = false
+credit_fight = false
+formation_index = 0
+
+[recruit]
+# Public recruitment. Refresh low-star tags, confirm and expedite 4-star+ results.
+enabled = true
+refresh = true
+select = [5, 4]
+confirm = [5, 4]
+times = 4
+set_time = true
+expedite = true
+# Optional. Leave unset to let MAA use expedited plans up to times.
+# expedite_times = 4
+skip_robot = true
+extra_tags_mode = 0
+
+[award]
+award = true
+mail = true
+# This is the limited headhunting daily free pull, not public recruitment.
+recruit = false
+orundum = false
+mining = false
+specialaccess = false
