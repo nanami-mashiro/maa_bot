@@ -576,6 +576,51 @@ class MaaCliExecutor:
         env["NO_COLOR"] = "1"
         return env
 
+    @staticmethod
+    async def _drain_until_exit(
+        process: asyncio.subprocess.Process,
+        timeout: int,
+        *,
+        drain_grace: float = 5.0,
+    ) -> tuple[bytes, bool]:
+        """Return (stdout_bytes, timed_out).
+
+        Reliable even when a child inherits the stdout pipe: waits on the process itself
+        (process.wait()) rather than on stdout EOF, while draining stdout concurrently so the
+        pipe buffer never fills. After exit, waits at most ``drain_grace`` for buffered
+        output, then gives up instead of blocking on a still-open inherited fd.
+        """
+        chunks: list[bytes] = []
+
+        async def _drain() -> None:
+            if process.stdout is None:
+                return
+            with contextlib.suppress(Exception):
+                while True:
+                    chunk = await process.stdout.read(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+
+        drain_task = asyncio.create_task(_drain())
+        timed_out = False
+        try:
+            await asyncio.wait_for(process.wait(), timeout=timeout)
+        except TimeoutError:
+            timed_out = True
+            process.kill()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=10)
+        # Process has exited / been killed. Let the drain flush briefly, then stop waiting
+        # even if a grandchild still holds the pipe open.
+        try:
+            await asyncio.wait_for(asyncio.shield(drain_task), timeout=drain_grace)
+        except TimeoutError:
+            drain_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await drain_task
+        return b"".join(chunks), timed_out
+
     async def _run_process(
         self,
         command: Sequence[str],
@@ -590,22 +635,24 @@ class MaaCliExecutor:
         )
         self._process = process
         try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            stdout, timed_out = await self._drain_until_exit(process, timeout)
             output = stdout.decode("utf-8", errors="replace") if stdout else ""
             if log_path:
                 log_path.write_text(output, encoding="utf-8")
+            if timed_out:
+                logger.warning(
+                    "进程超时被终止：command=%s timeout=%ss", command[0], timeout
+                )
+                return ProcessResult(
+                    exit_code=process.returncode,
+                    output=output,
+                    timed_out=True,
+                )
             return ProcessResult(
                 exit_code=process.returncode,
                 output=output,
                 cancelled=self._stop_requested,
             )
-        except TimeoutError:
-            process.kill()
-            stdout, _ = await process.communicate()
-            output = stdout.decode("utf-8", errors="replace") if stdout else ""
-            if log_path:
-                log_path.write_text(output, encoding="utf-8")
-            return ProcessResult(exit_code=process.returncode, output=output, timed_out=True)
         finally:
             self._process = None
             self._stop_requested = False
@@ -618,13 +665,13 @@ class MaaCliExecutor:
                 stderr=asyncio.subprocess.STDOUT,
                 env=self._env(),
             )
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
-            output = stdout.decode("utf-8", errors="replace") if stdout else ""
-            return ProcessResult(exit_code=process.returncode, output=output)
         except FileNotFoundError as exc:
             return ProcessResult(exit_code=127, output=str(exc))
-        except TimeoutError:
+        stdout, timed_out = await self._drain_until_exit(process, timeout)
+        if timed_out:
             return ProcessResult(exit_code=None, output="命令超时", timed_out=True)
+        output = stdout.decode("utf-8", errors="replace") if stdout else ""
+        return ProcessResult(exit_code=process.returncode, output=output)
 
     async def _run_screenshot(self, request: TaskRequest, started_at: datetime) -> TaskResult:
         try:

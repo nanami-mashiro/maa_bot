@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -811,6 +812,54 @@ Error: Some error occurred during running task!
         self.assertEqual(result.exit_code, 1)
         self.assertIn("关闭明日方舟失败", result.output)
         self.assertEqual(len(executor.simple_calls), 1)
+
+
+class DrainUntilExitTests(unittest.TestCase):
+    @staticmethod
+    async def _spawn(*args):
+        return await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+    def test_returns_when_parent_exits_despite_inherited_pipe(self):
+        # Regression for the event-loop freeze: the parent process exits immediately while a
+        # backgrounded grandchild inherits stdout and keeps the pipe open. communicate() would
+        # block until the grandchild exits (~30s); _drain_until_exit must return as soon as the
+        # tracked process itself exits.
+        async def scenario():
+            proc = await self._spawn("sh", "-c", "echo hello; sleep 30 & exit 0")
+            return await MaaCliExecutor._drain_until_exit(proc, timeout=60, drain_grace=1.0)
+
+        start = time.monotonic()
+        output, timed_out = asyncio.run(scenario())
+        elapsed = time.monotonic() - start
+        self.assertIn(b"hello", output)
+        self.assertFalse(timed_out)
+        self.assertLess(elapsed, 10)
+
+    def test_times_out_and_kills_a_slow_process(self):
+        async def scenario():
+            proc = await self._spawn("sh", "-c", "echo busy; sleep 30")
+            result = await MaaCliExecutor._drain_until_exit(proc, timeout=1, drain_grace=1.0)
+            return result, proc.returncode
+
+        start = time.monotonic()
+        (output, timed_out), returncode = asyncio.run(scenario())
+        elapsed = time.monotonic() - start
+        self.assertTrue(timed_out)
+        self.assertIsNotNone(returncode)
+        self.assertLess(elapsed, 10)
+
+    def test_normal_exit_captures_full_output(self):
+        async def scenario():
+            proc = await self._spawn("sh", "-c", "echo done")
+            return await MaaCliExecutor._drain_until_exit(proc, timeout=10)
+
+        output, timed_out = asyncio.run(scenario())
+        self.assertEqual(output, b"done\n")
+        self.assertFalse(timed_out)
 
 
 if __name__ == "__main__":
