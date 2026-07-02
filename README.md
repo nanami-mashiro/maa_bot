@@ -56,7 +56,7 @@ ARKNIGHTS_LOGIN_PASSWORD=
 
 `TELEGRAM_ALLOWED_USER_IDS` 是允许使用 Bot 的 Telegram user id，多个用户用英文逗号分隔。
 `ARKNIGHTS_LOGIN_USERNAME` 和 `ARKNIGHTS_LOGIN_PASSWORD` 只在启用自动登录时需要。
-当前 `docker-compose.yml` 默认让 Bot 容器使用宿主机网络，并通过宿主机 `127.0.0.1:7890` 代理访问 Telegram Bot API；如果你的代理端口不同，需要同步修改 compose 里的 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY`。
+当前 `docker-compose.yml` 让 Bot 容器使用宿主机网络。**默认不使用代理**，可直连 Telegram 的环境（如美国服务器）无需任何额外配置。如果你所在网络无法直连 Telegram（如中国大陆），在 `.env` 中设置 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`（例如 `http://127.0.0.1:7890`）即可；宿主机上需有对应代理在运行。
 
 如需调整 MAA 行为：
 

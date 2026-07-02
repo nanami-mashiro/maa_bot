@@ -6,8 +6,10 @@ mkdir -p "${MAA_CONFIG_DIR:-/data/maa-config}/profiles"
 mkdir -p "${BOT_LOG_DIR:-/data/logs}"
 
 if [ -n "${TZ:-}" ] && [ -f "/usr/share/zoneinfo/${TZ}" ]; then
-  ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime
-  printf '%s\n' "${TZ}" > /etc/timezone
+  # These may already be provided as read-only bind mounts (see docker-compose),
+  # so treat failures as non-fatal instead of letting `set -e` abort startup.
+  ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime 2>/dev/null || true
+  printf '%s\n' "${TZ}" > /etc/timezone 2>/dev/null || true
 fi
 
 if [ ! -f "${MAA_CONFIG_DIR:-/data/maa-config}/profiles/default.toml" ] \

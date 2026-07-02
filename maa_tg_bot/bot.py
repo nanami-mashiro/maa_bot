@@ -95,7 +95,7 @@ def build_application(config: AppConfig) -> Application:
         await executor.stop_current()
         await queue.stop()
 
-    application = (
+    builder = (
         ApplicationBuilder()
         .token(config.telegram.token)
         .connection_pool_size(16)
@@ -110,8 +110,11 @@ def build_application(config: AppConfig) -> Application:
         .get_updates_write_timeout(60)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
-        .build()
     )
+    if config.telegram.proxy:
+        logger.info("使用代理连接 Telegram: %s", config.telegram.proxy)
+        builder = builder.proxy(config.telegram.proxy).get_updates_proxy(config.telegram.proxy)
+    application = builder.build()
     application.bot_data["task_queue"] = queue
     application.bot_data["executor"] = executor
     application.bot_data["config"] = config

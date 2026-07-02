@@ -138,6 +138,7 @@ def _env_first(env: dict[str, str], *names: str) -> str | None:
 class TelegramConfig:
     token: str
     allowed_user_ids: set[int]
+    proxy: str | None = None
 
 
 @dataclass(frozen=True)
@@ -334,6 +335,22 @@ def load_config(path: Path | None = None, env: dict[str, str] | None = None) -> 
     if not allowed_ids:
         raise ConfigError("At least one Telegram allowed user id is required")
 
+    # python-telegram-bot/httpx do not honour the HTTP(S)_PROXY env vars
+    # automatically, so resolve a proxy explicitly and pass it to the builder.
+    proxy = (
+        _env_first(
+            env,
+            "TELEGRAM_PROXY",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        )
+        or (str(telegram.get("proxy", "")).strip() or None)
+    )
+
     login_enabled = _as_bool(
         _env_first(env, "ARKNIGHTS_LOGIN_ENABLED"),
         _as_bool(login.get("enabled"), False),
@@ -347,7 +364,7 @@ def load_config(path: Path | None = None, env: dict[str, str] | None = None) -> 
         )
 
     config = AppConfig(
-        telegram=TelegramConfig(token=token, allowed_user_ids=allowed_ids),
+        telegram=TelegramConfig(token=token, allowed_user_ids=allowed_ids, proxy=proxy),
         bot=BotConfig(
             log_dir=Path(_env_first(env, "BOT_LOG_DIR") or bot.get("log_dir", "/data/logs")),
             queue_size=int(_env_first(env, "BOT_QUEUE_SIZE") or bot.get("queue_size", 20)),

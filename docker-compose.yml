@@ -23,9 +23,11 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}
       TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:?set TELEGRAM_ALLOWED_USER_IDS in .env}
       TZ: ${TZ:-Asia/Shanghai}
-      HTTP_PROXY: http://127.0.0.1:7890
-      HTTPS_PROXY: http://127.0.0.1:7890
-      ALL_PROXY: http://127.0.0.1:7890
+      # 默认不走代理（美国等可直连 Telegram 的环境留空即可）。
+      # 如需代理（例如中国大陆），在 .env 中设置 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY。
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      ALL_PROXY: ${ALL_PROXY:-}
       ADB_CONNECT_HOST: 127.0.0.1:5555
       ADB_SERIAL: 127.0.0.1:5555
       ARKNIGHTS_LOGIN_ENABLED: ${ARKNIGHTS_LOGIN_ENABLED:-}
