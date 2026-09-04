@@ -1,20 +1,40 @@
 services:
   redroid:
-    image: redroid/redroid:12.0.0-latest
+    # 本地 x86_64 部署使用 redroid 11 + libndk ARM 转译镜像
+    # （由 ayasa520/redroid-script 生成：python redroid.py -a 11.0.0 -n）。
+    # 明日方舟官服 APK 只有 arm64-v8a/armeabi-v7a，x86 上必须走 native bridge。
+    image: redroid/redroid:11.0.0_ndk
     privileged: true
     restart: unless-stopped
     ports:
-      - "5555:5555"
+      # ADB 无鉴权,只绑宿主回环(scrcpy/adb 本机直连用),勿暴露局域网。
+      - "127.0.0.1:5555:5555"
     volumes:
       - redroid-data:/data
     command:
       - androidboot.redroid_width=1280
       - androidboot.redroid_height=720
       - androidboot.redroid_dpi=240
+      # 无 ashmem 的新内核(5.18+)使用 memfd 替代。
+      - androidboot.use_memfd=true
+      # Docker Desktop/WSL2 容器内无 GPU 设备，显式使用软件渲染。
+      - androidboot.redroid_gpu_mode=guest
+      # libndk ARM 转译（redroid-script README 中 11.0.0 的推荐参数）。
+      - ro.product.cpu.abilist=x86_64,arm64-v8a,x86,armeabi-v7a,armeabi
+      - ro.product.cpu.abilist64=x86_64,arm64-v8a
+      - ro.product.cpu.abilist32=x86,armeabi-v7a,armeabi
+      - ro.dalvik.vm.isa.arm=x86
+      - ro.dalvik.vm.isa.arm64=x86_64
+      - ro.enable.native.bridge.exec=1
+      - ro.vendor.enable.native.bridge.exec=1
+      - ro.vendor.enable.native.bridge.exec64=1
+      - ro.dalvik.vm.native.bridge=libndk_translation.so
+      - ro.ndk_translation.version=0.2.3
 
   maa-bot:
     build: .
-    network_mode: host
+    # Docker Desktop (WSL2) 上 host 网络指向的是 VM 而非 Windows 宿主机，
+    # 因此这里使用默认 compose 网络，通过服务名 redroid 直连 ADB。
     restart: unless-stopped
     depends_on:
       - redroid
@@ -28,8 +48,8 @@ services:
       HTTP_PROXY: ${HTTP_PROXY:-}
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       ALL_PROXY: ${ALL_PROXY:-}
-      ADB_CONNECT_HOST: 127.0.0.1:5555
-      ADB_SERIAL: 127.0.0.1:5555
+      ADB_CONNECT_HOST: redroid:5555
+      ADB_SERIAL: redroid:5555
       ARKNIGHTS_LOGIN_ENABLED: ${ARKNIGHTS_LOGIN_ENABLED:-}
       ARKNIGHTS_LOGIN_USERNAME: ${ARKNIGHTS_LOGIN_USERNAME:-}
       ARKNIGHTS_LOGIN_PASSWORD: ${ARKNIGHTS_LOGIN_PASSWORD:-}
@@ -52,8 +72,8 @@ services:
     volumes:
       - ./maa_tg_bot:/app/maa_tg_bot:ro
       - ./config:/app/config:ro
-      - /usr/share/zoneinfo/Asia/Shanghai:/etc/localtime:ro
-      - ./config/timezone:/etc/timezone:ro
+      # 时区由镜像内 tzdata + entrypoint 按 $TZ 设置，
+      # Docker Desktop 的 VM 里没有 /usr/share/zoneinfo 可供挂载。
       - maa-data:/root/.local/share/maa
       - maa-config:/data/maa-config
       - bot-logs:/data/logs

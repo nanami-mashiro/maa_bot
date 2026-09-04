@@ -30,6 +30,30 @@ Bot 不直接调用 MaaCore SDK，而是为每次任务生成 maa-cli 自定义�
 - MAA 集成任务协议：https://docs.maa.plus/zh-cn/protocol/integration.html
 - Linux 设备环境：https://docs.maa.plus/zh-cn/manual/device/linux.html
 
+## 一键部署(自动探测环境)
+
+`scripts/deploy/` 提供环境自适应引导脚本:动态探测 Docker 引擎的内核能力(binder/binderfs、ashmem)、CPU 架构(amd64/arm64)、是否 WSL2,再执行对应分支,幂等可重入(重跑自动跳过已完成阶段)。
+
+准备好 `.env`(见下文)后:
+
+```powershell
+# Windows(Docker Desktop/WSL2)。WSL2 内核默认没有 binder,
+# 脚本会在容器内编译带 binder 的同版本微软内核,确认后重启 Docker Desktop 切换。
+powershell -ExecutionPolicy Bypass -File scripts\deploy\deploy.ps1
+```
+
+```bash
+# 原生 Linux(amd64/arm64)。binder 缺失时先尝试 modprobe binder_linux。
+bash scripts/deploy/deploy.sh
+```
+
+分支逻辑:amd64 上官服 APK(仅 ARM 库)需要 libndk 转译,脚本用 redroid-script 构建 `redroid/redroid:11.0.0_ndk` 并生成含 native-bridge 参数的 `docker-compose.override.yml`;arm64 直接用官方 redroid 镜像。之后统一:起 redroid → 等 `sys.boot_completed` → 下载/安装官服 APK(缓存 `.deploy-cache/`)→ 启动游戏验证 → `maa install` → 起 bot → 输出摘要。
+
+注意:
+- 镜像拉取由 Docker 守护进程执行,不走 `.env` 里的代理;若拉取停滞,Windows 端脚本会把代理写入 Docker Desktop 设置(与内核切换共用一次重启),Linux 端参考 `daemon.json` 的 `proxies` 配置。
+- 内核切换需重启 Docker Desktop,会中断宿主上所有容器;脚本重启前列出受影响容器等确认(`-Yes`/`--yes` 跳过)。失败自动回滚 `.wslconfig`。
+- 首次账号登录如遇验证码无法自动化:宿主 `adb connect 127.0.0.1:5555` + scrcpy 手动登录一次,登录态持久化在 `redroid-data` 卷。
+
 ## 快速开始
 
 本地开发使用 uv：

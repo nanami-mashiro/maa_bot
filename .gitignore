@@ -10,3 +10,5 @@ data/
 logs/
 .env
 config/bot.toml
+.deploy-cache/
+docker-compose.override.yml

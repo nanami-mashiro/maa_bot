@@ -1,6 +1,6 @@
 [connection]
 adb_path = "adb"
-address = "127.0.0.1:5555"
+address = "redroid:5555"
 config = "CompatPOSIXShell"
 
 [resource]

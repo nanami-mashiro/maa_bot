@@ -14,8 +14,10 @@ RUN apt-get update \
         adb \
         ca-certificates \
         curl \
+        git \
         libatomic1 \
         libgomp1 \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://raw.githubusercontent.com/MaaAssistantArknights/maa-cli/main/install.sh | bash
@@ -28,7 +30,9 @@ COPY pyproject.toml uv.lock README.md ./
 COPY maa_tg_bot ./maa_tg_bot
 COPY scripts/entrypoint.sh /entrypoint.sh
 
-RUN uv sync --frozen --no-dev \
+# 防御 Windows CRLF checkout:入口脚本必须是 LF,否则 shebang 带 \r 无法执行。
+RUN sed -i 's/\r$//' /entrypoint.sh \
+    && uv sync --frozen --no-dev \
     && chmod 755 /entrypoint.sh
 
 VOLUME ["/data/maa-config", "/data/logs"]

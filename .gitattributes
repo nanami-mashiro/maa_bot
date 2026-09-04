@@ -1,0 +1,9 @@
+# 进容器/Linux 执行的文件必须保持 LF,不受 Windows checkout 的 autocrlf 影响。
+* text=auto
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.ps1 text eol=crlf
+*.apk binary
+*.png binary
