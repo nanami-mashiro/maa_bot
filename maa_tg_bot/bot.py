@@ -496,6 +496,11 @@ async def daily_scheduler_loop(application: Application, timezone: ZoneInfo) -> 
         wait_seconds = max(0.0, (next_run - now).total_seconds())
         logger.info("下一次定时日常将在 %s 执行", next_run.isoformat())
         await asyncio.sleep(wait_seconds)
+        # asyncio.sleep 按单调钟计时,WSL2 墙钟漂移回拨会导致提前醒来;
+        # 未到点就补睡。否则提前触发后,循环顶重算出的"下一次"仍是同一
+        # 时刻,同一时间点会连发两次。
+        while (remaining := (next_run - datetime.now(timezone)).total_seconds()) > 0:
+            await asyncio.sleep(remaining)
         try:
             await queue_scheduled_daily(application)
         except Exception:
