@@ -106,5 +106,41 @@ class TaskQueueTests(unittest.TestCase):
         self.assertTrue(delegated)
 
 
+class TaskQueueNotifyFailureTests(unittest.TestCase):
+    def test_worker_survives_notify_failure(self):
+        async def scenario():
+            executor = FakeExecutor()
+            queue = TaskQueue(executor, maxsize=3)
+            await queue.start()
+            delivered = []
+            second_done = asyncio.Event()
+
+            async def broken_notify(result):
+                raise RuntimeError("telegram down")
+
+            async def ok_notify(result):
+                delivered.append(result.request.id)
+                second_done.set()
+
+            await queue.enqueue(
+                TaskRequest(kind=TaskKind.DAILY, requested_by=0, chat_id=1, id="first",
+                            notify=broken_notify)
+            )
+            await queue.enqueue(
+                TaskRequest(kind=TaskKind.DAILY, requested_by=0, chat_id=1, id="second",
+                            notify=ok_notify)
+            )
+            with self.assertLogs("maa_tg_bot.task_queue", level="ERROR"):
+                await asyncio.wait_for(second_done.wait(), timeout=5)
+            worker_alive = not queue._worker_task.done()
+            await queue.stop()
+            return executor.calls, delivered, worker_alive
+
+        calls, delivered, worker_alive = asyncio.run(scenario())
+        self.assertEqual(calls, ["first", "second"])
+        self.assertEqual(delivered, ["second"])
+        self.assertTrue(worker_alive)
+
+
 if __name__ == "__main__":
     unittest.main()

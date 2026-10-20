@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from typing import Protocol
 
 from .models import QueueSnapshot, TaskRequest, TaskResult, TaskState
+
+logger = logging.getLogger(__name__)
 
 
 class TaskExecutor(Protocol):
@@ -80,4 +83,9 @@ class TaskQueue:
 
             self._last_result = result
             if request.notify:
-                await request.notify(result)
+                # 通知失败（例如 Telegram 网络中断）绝不能让 worker 退出，
+                # 否则之后排队的任务（含定时日常）会永远不再执行。
+                try:
+                    await request.notify(result)
+                except Exception:
+                    logger.exception("任务 %s 结果通知失败", request.id)
