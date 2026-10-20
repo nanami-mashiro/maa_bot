@@ -1,3 +1,9 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   redroid:
     # 本地 x86_64 部署使用 redroid 11 + libndk ARM 转译镜像
@@ -6,6 +12,7 @@ services:
     image: redroid/redroid:11.0.0_ndk
     privileged: true
     restart: unless-stopped
+    logging: *default-logging
     ports:
       # ADB 无鉴权,只绑宿主回环(scrcpy/adb 本机直连用),勿暴露局域网。
       - "127.0.0.1:5555:5555"
@@ -36,6 +43,9 @@ services:
     # Docker Desktop (WSL2) 上 host 网络指向的是 VM 而非 Windows 宿主机，
     # 因此这里使用默认 compose 网络，通过服务名 redroid 直连 ADB。
     restart: unless-stopped
+    logging: *default-logging
+    # 收到 SIGTERM 后要先停掉正在跑的 maa 进程再关队列(最多约 10s)，给足时间优雅退出，避免被 SIGKILL(137)。
+    stop_grace_period: 30s
     depends_on:
       - redroid
     environment:
