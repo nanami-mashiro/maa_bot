@@ -72,6 +72,10 @@ class TaskStopRequested(Exception):
 
 
 class MaaCliExecutor:
+    ADB_READY_TIMEOUT_SECONDS = 180
+    ADB_READY_INITIAL_DELAY = 2.0
+    ADB_READY_MAX_DELAY = 30.0
+
     def __init__(
         self,
         config: AppConfig,
@@ -572,14 +576,53 @@ class MaaCliExecutor:
             raise TaskStopRequested
 
     async def ensure_adb(self) -> None:
-        if not self.config.android.adb_connect_host:
-            return
-        result = await self._run_simple(
-            [self.config.android.adb_bin, "connect", self.config.android.adb_connect_host],
-            timeout=15,
-        )
-        if result.exit_code != 0:
-            raise RuntimeError(f"ADB 连接失败：{tail_text(result.output, 1000)}")
+        """Connect ADB and wait until Android reports sys.boot_completed=1.
+
+        Right after redroid (re)starts, adb may connect while the framework is
+        still booting, which makes StartUp fail for no real reason. Retry with
+        backoff up to ADB_READY_TIMEOUT_SECONDS before giving up.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.ADB_READY_TIMEOUT_SECONDS
+        delay = self.ADB_READY_INITIAL_DELAY
+        last_output = ""
+        attempt = 0
+        while True:
+            attempt += 1
+            if self.config.android.adb_connect_host:
+                result = await self._run_simple(
+                    [self.config.android.adb_bin, "connect", self.config.android.adb_connect_host],
+                    timeout=15,
+                )
+                last_output = result.output
+            boot = await self._run_simple(
+                [
+                    self.config.android.adb_bin,
+                    "-s",
+                    self.config.android.adb_serial,
+                    "shell",
+                    "getprop",
+                    "sys.boot_completed",
+                ],
+                timeout=15,
+            )
+            if boot.exit_code == 0 and boot.output.strip() == "1":
+                if attempt > 1:
+                    logger.info("Android 已完成启动（第 %s 次检查）", attempt)
+                return
+            last_output = boot.output or last_output
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "ADB 设备未就绪（sys.boot_completed != 1）："
+                    f"{tail_text(last_output, 1000)}"
+                )
+            logger.info("等待 Android 启动完成，%.0f 秒后重试（第 %s 次）", min(delay, remaining), attempt)
+            await self._ready_sleep(min(delay, remaining))
+            delay = min(delay * 2, self.ADB_READY_MAX_DELAY)
+
+    async def _ready_sleep(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
 
     async def stop_current(self) -> bool:
         self._stop_requested = True

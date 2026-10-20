@@ -949,5 +949,40 @@ class DrainUntilExitTests(unittest.TestCase):
         self.assertFalse(timed_out)
 
 
+class EnsureAdbReadyTests(unittest.TestCase):
+    class ReadyExecutor(MaaCliExecutor):
+        def __init__(self, config, boot_outputs):
+            super().__init__(config, login_manager=FakeLoginManager())
+            self.boot_outputs = list(boot_outputs)
+            self.simple_calls = []
+            self.sleeps = []
+
+        async def _run_simple(self, command, timeout):
+            self.simple_calls.append(list(command))
+            if "getprop" in command:
+                output = self.boot_outputs.pop(0) if self.boot_outputs else ""
+                return ProcessResult(exit_code=0, output=output)
+            return ProcessResult(exit_code=0, output="connected")
+
+        async def _ready_sleep(self, seconds):
+            self.sleeps.append(seconds)
+
+    def test_waits_for_boot_completed_with_backoff(self):
+        executor = self.ReadyExecutor(test_config(), ["", "0\n", "1\n"])
+
+        asyncio.run(executor.ensure_adb())
+
+        self.assertEqual(executor.sleeps, [2.0, 4.0])
+        getprops = [call for call in executor.simple_calls if "getprop" in call]
+        self.assertEqual(len(getprops), 3)
+
+    def test_raises_when_device_never_boots(self):
+        executor = self.ReadyExecutor(test_config(), [])
+        executor.ADB_READY_TIMEOUT_SECONDS = 0
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(executor.ensure_adb())
+
+
 if __name__ == "__main__":
     unittest.main()
