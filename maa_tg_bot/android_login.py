@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -86,14 +87,40 @@ def account_login_button_visible(width: int, height: int, pixel_at: PixelAt) -> 
     )
 
 
-def data_expired_dialog_visible(width: int, height: int, pixel_at: PixelAt) -> bool:
-    """Recognize the Unity dialog 「数据文件已过期，请重新登录」 (one confirm button).
+# Text lines (white glyphs) inside the one-button dialog band, measured on the
+# 1280x720 reference layout as (top, bottom, left, right). Unity renders these
+# at fixed positions, so the line geometry tells the dialogs apart without OCR.
+DIALOG_TEXT_SCAN_Y = (180, 440)
+DIALOG_TEXT_SCAN_X = (300, 980)
+DIALOG_LINE_TOLERANCE = 10
+DIALOG_CENTER_TOLERANCE = 20
+DIALOG_DATA_EXPIRED = "data_expired"
+DIALOG_UPDATE_FAILED = "update_failed"
+DIALOG_NETWORK_LOST = "network_lost"
+DIALOG_UNKNOWN = "unknown"
+DIALOG_TEXT_SIGNATURES: dict[str, tuple[tuple[int, int, int, int], ...]] = {
+    # 「数据文件已过期，请重新登录」
+    DIALOG_DATA_EXPIRED: ((320, 343, 472, 806),),
+    # 「更新下载失败，请检查网络连接后确认重试」/「错误号:207」
+    DIALOG_UPDATE_FAILED: ((297, 320, 395, 885), (344, 367, 575, 702)),
+    # 「与神经网络连接丢失，请重新连接」/「(错误号:0)」
+    DIALOG_NETWORK_LOST: ((280, 303, 447, 833), (327, 353, 583, 696)),
+}
 
-    Shown when the saved session expired; confirming it brings the game back to
-    the title screen (sometimes after re-unpacking resources), where the
-    「账号登录」 button appears. uiautomator cannot see it, so match pixels.
+
+def _ratio_ok(width: int, height: int) -> bool:
+    return width > 0 and height > 0 and abs(width / height - 16 / 9) <= 0.02
+
+
+def one_button_dialog_visible(width: int, height: int, pixel_at: PixelAt) -> bool:
+    """Recognize the game's Unity one-button dialog frame.
+
+    A full-width dark gray band with the message, a near-black strip below it
+    and a white round confirm (check mark) button. Used by 「数据文件已过期」,
+    「更新下载失败 错误号:207」 and 「与神经网络连接丢失 (错误号:0)」 alike.
+    uiautomator cannot see it, so match pixels.
     """
-    if width <= 0 or height <= 0 or abs(width / height - 16 / 9) > 0.02:
+    if not _ratio_ok(width, height):
         return False
 
     def hits(points: tuple[tuple[int, int], ...], predicate: Callable[[tuple[int, int, int]], bool]) -> int:
@@ -122,6 +149,112 @@ def data_expired_dialog_visible(width: int, height: int, pixel_at: PixelAt) -> b
     # The round button is mostly white with a dark check mark; a solid white or
     # solid dark area is something else.
     return samples > 0 and 0.2 <= white / samples <= 0.9
+
+
+def dialog_text_lines(width: int, height: int, pixel_at: PixelAt) -> list[tuple[int, int, int, int]]:
+    """Return white text lines in the dialog band as reference (top, bottom, left, right)."""
+    ref_width, ref_height = REFERENCE_SIZE
+    x_start, x_end = DIALOG_TEXT_SCAN_X
+    y_start, y_end = DIALOG_TEXT_SCAN_Y
+    columns = [(ref_x, min(width - 1, round(ref_x * width / ref_width))) for ref_x in range(x_start, x_end)]
+    lines: list[list[int]] = []
+    current: list[int] | None = None
+    gap = 0
+    for ref_y in range(y_start, y_end):
+        y = min(height - 1, round(ref_y * height / ref_height))
+        xs = [ref_x for ref_x, x in columns if _is_text_pixel(pixel_at(x, y))]
+        if len(xs) >= 2:
+            if current is None:
+                current = [ref_y, ref_y, xs[0], xs[-1]]
+            else:
+                current[1] = ref_y
+                current[2] = min(current[2], xs[0])
+                current[3] = max(current[3], xs[-1])
+            gap = 0
+        elif current is not None:
+            gap += 1
+            if gap > 3:
+                lines.append(current)
+                current = None
+                gap = 0
+    if current is not None:
+        lines.append(current)
+    return [tuple(line) for line in lines if line[1] - line[0] >= 8]  # type: ignore[misc]
+
+
+def _line_matches(
+    actual: tuple[int, int, int, int],
+    expected: tuple[int, int, int, int],
+    *,
+    exact_width: bool,
+) -> bool:
+    tol = DIALOG_LINE_TOLERANCE
+    if abs(actual[0] - expected[0]) > tol or abs(actual[1] - expected[1]) > tol:
+        return False
+    if exact_width:
+        return abs(actual[2] - expected[2]) <= tol and abs(actual[3] - expected[3]) <= tol
+    # Second lines hold the error number, which may change length; it is centered.
+    actual_center = (actual[2] + actual[3]) / 2
+    expected_center = (expected[2] + expected[3]) / 2
+    return abs(actual_center - expected_center) <= DIALOG_CENTER_TOLERANCE
+
+
+def classify_dialog_text(lines: Sequence[tuple[int, int, int, int]]) -> str:
+    for kind, signature in DIALOG_TEXT_SIGNATURES.items():
+        if len(lines) != len(signature):
+            continue
+        if all(
+            _line_matches(actual, expected, exact_width=index == 0)
+            for index, (actual, expected) in enumerate(zip(lines, signature))
+        ):
+            return kind
+    return DIALOG_UNKNOWN
+
+
+def classify_one_button_dialog(width: int, height: int, pixel_at: PixelAt) -> str | None:
+    """Return the dialog kind (DIALOG_*) when a one-button dialog is visible, else None."""
+    if not one_button_dialog_visible(width, height, pixel_at):
+        return None
+    return classify_dialog_text(dialog_text_lines(width, height, pixel_at))
+
+
+def data_expired_dialog_visible(width: int, height: int, pixel_at: PixelAt) -> bool:
+    """Recognize the Unity dialog 「数据文件已过期，请重新登录」 (one confirm button).
+
+    Shown when the saved session expired; confirming it brings the game back to
+    the title screen (sometimes after re-unpacking resources), where the
+    「账号登录」 button appears. Dialogs recognized as something else (update
+    download failure 207, network lost 0) are excluded: confirming those does
+    not lead to the title screen and they are handled by game_recovery.
+    """
+    kind = classify_one_button_dialog(width, height, pixel_at)
+    return kind in (DIALOG_DATA_EXPIRED, DIALOG_UNKNOWN)
+
+
+async def adb_screencap_png(adb_bin: str, serial: str, timeout: float = 15) -> bytes:
+    """Return a PNG screenshot from the device, or b"" on any failure."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            adb_bin,
+            "-s",
+            serial,
+            "exec-out",
+            "screencap",
+            "-p",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (FileNotFoundError, PermissionError):
+        return b""
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        return b""
+    if process.returncode != 0 or not stdout.startswith(b"\x89PNG"):
+        return b""
+    return stdout
 
 
 def png_pixel_at(data: bytes) -> tuple[int, int, PixelAt]:
@@ -176,6 +309,10 @@ def _is_login_button_pixel(pixel: tuple[int, int, int]) -> bool:
 def _is_dialog_band_pixel(pixel: tuple[int, int, int]) -> bool:
     red, green, blue = pixel
     return 40 <= red <= 70 and abs(red - green) < 8 and abs(green - blue) < 8
+
+
+def _is_text_pixel(pixel: tuple[int, int, int]) -> bool:
+    return min(pixel) >= 200 and max(pixel) - min(pixel) < 25
 
 
 def _is_dialog_strip_pixel(pixel: tuple[int, int, int]) -> bool:
@@ -332,23 +469,7 @@ class AndroidLoginManager:
         return None
 
     async def _capture_png(self) -> bytes:
-        try:
-            process = await asyncio.create_subprocess_exec(
-                self.config.android.adb_bin,
-                "-s",
-                self.config.android.adb_serial,
-                "exec-out",
-                "screencap",
-                "-p",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=15)
-        except (FileNotFoundError, TimeoutError):
-            return b""
-        if process.returncode != 0 or not stdout.startswith(b"\x89PNG"):
-            return b""
-        return stdout
+        return await adb_screencap_png(self.config.android.adb_bin, self.config.android.adb_serial)
 
     async def _perform_official_login(self) -> None:
         await self._open_password_login_form()
