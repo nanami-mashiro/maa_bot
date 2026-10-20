@@ -8,6 +8,7 @@ from maa_tg_bot.android_login import (
     AndroidLoginError,
     AndroidLoginManager,
     account_login_button_visible,
+    data_expired_dialog_visible,
     png_pixel_at,
 )
 from maa_tg_bot.config import load_config
@@ -55,6 +56,7 @@ class TestLoginManager(AndroidLoginManager):
         ui_xmls = kwargs.pop("ui_xmls", None)
         self.title_button_visible = kwargs.pop("title_button_visible", False)
         self.form_closes_on_login = kwargs.pop("form_closes_on_login", True)
+        self.data_expired_visible = kwargs.pop("data_expired_visible", None)
         super().__init__(
             *args,
             sleep=self.no_sleep,
@@ -65,6 +67,9 @@ class TestLoginManager(AndroidLoginManager):
 
     async def _title_account_button_visible(self):
         return self.title_button_visible
+
+    async def _data_expired_dialog_visible(self):
+        return self.data_expired_visible
 
     async def _tap(self, x: int, y: int) -> None:
         await super()._tap(x, y)
@@ -338,6 +343,76 @@ class AndroidLoginManagerTests(unittest.TestCase):
             return (20, 20, 20)
 
         self.assertFalse(account_login_button_visible(1280, 720, wrong_pixel))
+
+    def test_confirms_data_expired_dialog_then_logs_in_from_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp))
+            runner = FakeRunner()
+            manager = TestLoginManager(
+                config,
+                runner.run_simple,
+                ui_xmls=[EMPTY_UI_XML, PASSWORD_LOGIN_UI_XML],
+                title_button_visible=(1280, 720),
+                data_expired_visible=(1280, 720),
+            )
+
+            logged_in = asyncio.run(manager.login_if_needed())
+
+        self.assertTrue(logged_in)
+        taps = [tuple(call[0][-2:]) for call in runner.simple_calls if "tap" in call[0]]
+        self.assertEqual(taps[0], ("640", "491"))
+        self.assertEqual(taps[1], ("640", "512"))
+        self.assertTrue(any("input text" in script for script in manager.shell_scripts))
+
+    def test_data_expired_dialog_without_title_button_does_not_type_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp))
+            runner = FakeRunner()
+            manager = TestLoginManager(
+                config,
+                runner.run_simple,
+                ui_xmls=[EMPTY_UI_XML],
+                title_button_visible=None,
+                data_expired_visible=(1280, 720),
+            )
+
+            with self.assertRaises(AndroidLoginError):
+                asyncio.run(manager.login_if_needed())
+
+        self.assertEqual(manager.shell_scripts, [])
+        taps = [tuple(call[0][-2:]) for call in runner.simple_calls if "tap" in call[0]]
+        self.assertEqual(taps, [("640", "491")])
+
+    def test_data_expired_dialog_pixel_detection(self):
+        def dialog(x: int, y: int) -> tuple[int, int, int]:
+            if 620 <= x <= 660 and 470 <= y <= 512:
+                # white round button with a dark check mark stroke
+                return (20, 20, 20) if abs((x - 640) - (y - 491)) <= 3 else (255, 255, 255)
+            if 165 <= y <= 455:
+                return (52, 52, 52)
+            if 456 <= y <= 530:
+                return (12, 12, 12)
+            return (188, 188, 188)
+
+        self.assertTrue(data_expired_dialog_visible(1280, 720, dialog))
+
+        def scaled(x: int, y: int) -> tuple[int, int, int]:
+            return dialog(round(x * 1280 / 1920), round(y * 720 / 1080))
+
+        self.assertTrue(data_expired_dialog_visible(1920, 1080, scaled))
+        self.assertFalse(data_expired_dialog_visible(1280, 1024, dialog))
+
+        def all_dark(_x: int, _y: int) -> tuple[int, int, int]:
+            return (12, 12, 12)
+
+        self.assertFalse(data_expired_dialog_visible(1280, 720, all_dark))
+
+        def title_button(x: int, y: int) -> tuple[int, int, int]:
+            if 520 <= x <= 760 and 476 <= y <= 548:
+                return (85, 85, 85)
+            return (230, 230, 230)
+
+        self.assertFalse(data_expired_dialog_visible(1280, 720, title_button))
 
     def test_png_pixel_at_reads_rgb_pixels(self):
         png = _rgb_png(2, 1, {(0, 0): (85, 86, 87), (1, 0): (230, 231, 232)})
