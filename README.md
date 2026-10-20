@@ -123,6 +123,18 @@ docker compose exec maa-bot adb -s 127.0.0.1:5555 get-state
 
 默认建议先人工完成明日方舟账号登录、验证码、安全验证和资源下载，可以用 scrcpy、VNC、投屏工具或 ADB 截图/输入完成首次登录。`redroid-data:/data` 会持久化登录态。
 
+### libndk 0.2.3 下游戏闪退(2.7.81+)
+
+x86_64 + libndk 转译时，明日方舟 2.7.81 起会在启动约 12 秒后 `SIGSEGV (SEGV_ACCERR)` 闪退（停在加载页），原因是 libndk 的 `MprotectForGuest` 会清掉 guest 页的执行权限。修补方法（只改 1 个字节，可随时删除文件回滚）：
+
+```bash
+mkdir -p redroid
+docker cp maa-redroid-1:/system/lib64/libndk_translation.so redroid/libndk_translation.so.orig
+python scripts/deploy/lib/patch_libndk.py redroid/libndk_translation.so.orig redroid/libndk_translation.so
+```
+
+`gen-override.sh` 检测到 `redroid/libndk_translation.so` 时会在 override 中把它只读挂载到 `/system/lib64/libndk_translation.so`（手工维护 override 的话加同样一行 volumes），然后 `docker compose up -d redroid`。参考：<https://blog.chilldove.com/posts/redroid11-arknights-ndk-translation-mprotect/>
+
 默认 maa-cli profile 使用 `touch_mode = "ADB"`。在 redroid 环境里这个模式比 `MaaTouch` 慢一些，但更稳定。
 
 如果要尝试官服账号密码自动登录，在 `config/bot.toml` 中设置：
@@ -132,7 +144,7 @@ docker compose exec maa-bot adb -s 127.0.0.1:5555 get-state
 enabled = true
 ```
 
-也可以在 `.env` 中设置 `ARKNIGHTS_LOGIN_ENABLED=true`。然后在 `.env` 中填写 `ARKNIGHTS_LOGIN_USERNAME` 和 `ARKNIGHTS_LOGIN_PASSWORD`。Bot 会先用 MAA 的 `StartUp` 单独启动游戏；启动失败会关闭游戏并按 `[maa].startup_retries` 重试。若当前画面是官服登录表单，或 1280x720 标题页上的「账号登录」按钮，会先自动输入账号密码，再重试一次启动。自动登录器也会在后续 MAA 任务失败且当前界面明确是官服登录页时再试一次。该自动登录器只适配当前 redroid 的 1280x720 官服登录页；遇到验证码、安全验证、错误密码或页面变化时会失败退出，不会尝试绕过验证。
+也可以在 `.env` 中设置 `ARKNIGHTS_LOGIN_ENABLED=true`。然后在 `.env` 中填写 `ARKNIGHTS_LOGIN_USERNAME` 和 `ARKNIGHTS_LOGIN_PASSWORD`。Bot 会先用 MAA 的 `StartUp` 单独启动游戏；启动失败会关闭游戏并按 `[maa].startup_retries` 重试。若当前画面是官服登录表单，或标题页上的「账号登录」按钮（按 1280x720 坐标等比缩放识别），会点击一次按钮，只有在 uiautomator 确认出现账号/密码输入框后才输入账号密码，并在点击登录后确认登录表单已关闭，再重试一次启动；表单未出现时直接失败，不会输入凭据。自动登录器也会在后续 MAA 任务失败且当前界面明确是官服登录页时再试一次。该自动登录器只适配当前 redroid 的 1280x720 官服登录页；遇到验证码、安全验证、错误密码或页面变化时会失败退出，不会尝试绕过验证。
 
 如果游戏客户端强制更新导致 `StartUp` 失败，Bot 会在日志包含疑似客户端过期信号时，从官服下载 APK 并通过 `adb install -r` 安装，然后重试一次启动。该行为由 `[client_update]` 控制；安装成功后会删除 `$MAA_CONFIG_DIR/cache/arknights-official.apk`，安装失败时会保留该文件方便排查。
 

@@ -12,3 +12,5 @@ logs/
 config/bot.toml
 .deploy-cache/
 docker-compose.override.yml
+# 本机生成的 libndk 修补版(由 scripts/deploy/lib/patch_libndk.py 产出,二进制不入库)
+redroid/
