@@ -35,18 +35,43 @@ SleepFunc = Callable[[float], Awaitable[None]]
 PixelAt = Callable[[int, int], tuple[int, int, int]]
 
 
-def account_login_button_visible(width: int, height: int, pixel_at: PixelAt) -> bool:
-    """Recognize the logged-out official title button on the 1280x720 redroid layout.
+REFERENCE_SIZE = (1280, 720)
+TITLE_BUTTON_POINTS = ((640, 512), (560, 513), (720, 513), (640, 490), (640, 536))
+TITLE_BACKGROUND_POINTS = ((400, 513), (900, 513), (640, 460), (640, 560))
 
-    The title screen is drawn by Unity, so uiautomator cannot see 「账号登录」.
-    The button is the dark gray rectangle centered near (640, 512).
+
+def scale_point(point: tuple[int, int], width: int, height: int) -> tuple[int, int]:
+    """Map a coordinate measured on the 1280x720 reference layout to the actual screen."""
+    ref_width, ref_height = REFERENCE_SIZE
+    return (round(point[0] * width / ref_width), round(point[1] * height / ref_height))
+
+
+def account_login_button_visible(width: int, height: int, pixel_at: PixelAt) -> bool:
+    """Recognize the logged-out official title button (「账号登录」).
+
+    The title screen is drawn by Unity, so uiautomator cannot see the button.
+    It is a dark gray rectangle centered near (640, 512) on the 1280x720 reference
+    layout, surrounded by the light title background. Coordinates are scaled to the
+    real screenshot size (16:9 only) and one sample of each group may miss, so a
+    slightly shifted render or a bit of anti-aliasing does not break detection.
     """
-    if (width, height) != (1280, 720):
+    if width <= 0 or height <= 0 or abs(width / height - 16 / 9) > 0.02:
         return False
-    button_points = ((640, 512), (560, 513), (720, 513), (640, 490), (640, 536))
-    background_points = ((400, 513), (900, 513), (640, 460), (640, 560))
-    return all(_is_login_button_pixel(pixel_at(*point)) for point in button_points) and all(
-        _is_login_background_pixel(pixel_at(*point)) for point in background_points
+
+    def matches(points: tuple[tuple[int, int], ...], predicate: Callable[[tuple[int, int, int]], bool]) -> int:
+        count = 0
+        for point in points:
+            x, y = scale_point(point, width, height)
+            if 0 <= x < width and 0 <= y < height and predicate(pixel_at(x, y)):
+                count += 1
+        return count
+
+    button_hits = matches(TITLE_BUTTON_POINTS, _is_login_button_pixel)
+    background_hits = matches(TITLE_BACKGROUND_POINTS, _is_login_background_pixel)
+    return (
+        _is_login_button_pixel(pixel_at(*scale_point(TITLE_BUTTON_POINTS[0], width, height)))
+        and button_hits >= len(TITLE_BUTTON_POINTS) - 1
+        and background_hits >= len(TITLE_BACKGROUND_POINTS) - 1
     )
 
 
@@ -96,12 +121,12 @@ def png_pixel_at(data: bytes) -> tuple[int, int, PixelAt]:
 
 def _is_login_button_pixel(pixel: tuple[int, int, int]) -> bool:
     red, green, blue = pixel
-    return 70 <= red <= 110 and abs(red - green) < 12 and abs(green - blue) < 12
+    return 60 <= red <= 120 and abs(red - green) < 16 and abs(green - blue) < 16
 
 
 def _is_login_background_pixel(pixel: tuple[int, int, int]) -> bool:
     red, green, blue = pixel
-    return red >= 200 and green >= 200 and blue >= 200 and abs(red - green) < 15 and abs(green - blue) < 15
+    return red >= 190 and green >= 190 and blue >= 190 and abs(red - green) < 20 and abs(green - blue) < 20
 
 
 def _unfilter_png_row(row: bytearray, previous: bytearray, filter_type: int, channels: int) -> None:
@@ -145,6 +170,9 @@ class AndroidLoginManager:
     AGREEMENT_TAP = (450, 418)
     LOGIN_BUTTON_TAP = (640, 498)
     LOGIN_TEXT_MARKERS = ("密码登录", "账号登录", "账户登录", "手机号登录", "登录账号")
+    FORM_OPEN_POLLS = 10
+    LOGIN_RESULT_POLLS = 8
+    LOGIN_RESULT_POLL_SECONDS = 5
 
     def __init__(
         self,
@@ -158,33 +186,34 @@ class AndroidLoginManager:
         self._sleep = sleep
 
     async def login_if_needed(self) -> bool:
-        """Log in when the native login form or the logged-out title button is visible."""
+        """Log in when the native login form or the logged-out title button is visible.
+
+        Credentials are only typed after uiautomator confirms the native password
+        form (account + password inputs). If the form never shows up, this raises
+        AndroidLoginError without typing anything.
+        """
         if not self.config.login.enabled:
             return False
-        if await self._login_if_screen_visible():
-            return True
-        if not await self._title_account_button_visible():
-            return False
-
-        logger.info("检测到官服标题页的账号登录按钮，打开登录表单")
-        await self._tap(*self.ACCOUNT_LOGIN_TAP)
-        await self._sleep(3)
-        if await self._login_if_screen_visible():
-            return True
-        try:
-            await asyncio.wait_for(
-                self._perform_official_login(),
-                timeout=self.config.login.login_timeout_seconds,
-            )
-        except TimeoutError as exc:
-            raise AndroidLoginError("明日方舟自动登录超时") from exc
-        return True
-
-    async def _login_if_screen_visible(self) -> bool:
         root, _ = await self._dump_ui_tree()
-        if root is None or not self._looks_like_official_login_screen(root):
+        if root is not None and self._looks_like_official_login_screen(root):
+            await self._login_with_timeout()
+            return True
+
+        screen_size = await self._title_account_button_visible()
+        if not screen_size:
             return False
 
+        width, height = screen_size if isinstance(screen_size, tuple) else REFERENCE_SIZE
+        tap_x, tap_y = scale_point(self.ACCOUNT_LOGIN_TAP, width, height)
+        logger.info("检测到官服标题页的账号登录按钮，点击 (%s,%s) 打开登录表单", tap_x, tap_y)
+        # Tap the Unity title button exactly once; a second tap on the same spot
+        # could land on whatever the login dialog draws there.
+        await self._tap(tap_x, tap_y)
+        await self._sleep(3)
+        await self._login_with_timeout()
+        return True
+
+    async def _login_with_timeout(self) -> None:
         try:
             await asyncio.wait_for(
                 self._perform_official_login(),
@@ -192,18 +221,20 @@ class AndroidLoginManager:
             )
         except TimeoutError as exc:
             raise AndroidLoginError("明日方舟自动登录超时") from exc
-        return True
 
-    async def _title_account_button_visible(self) -> bool:
+    async def _title_account_button_visible(self) -> tuple[int, int] | None:
+        """Return the screen size when the title account button is visible, else None."""
         png = await self._capture_png()
         if not png:
-            return False
+            return None
         try:
             width, height, pixel_at = png_pixel_at(png)
         except (ValueError, zlib.error, struct.error) as exc:
             logger.warning("解析截图失败，跳过标题页登录识别：%s", exc)
-            return False
-        return account_login_button_visible(width, height, pixel_at)
+            return None
+        if account_login_button_visible(width, height, pixel_at):
+            return (width, height)
+        return None
 
     async def _capture_png(self) -> bytes:
         try:
@@ -227,6 +258,7 @@ class AndroidLoginManager:
     async def _perform_official_login(self) -> None:
         await self._open_password_login_form()
 
+        await self._require_password_form("输入账号前")
         await self._tap_login_resource(
             "hg_login_view_edit_text_input_account",
             fallback=self.USERNAME_FIELD_TAP,
@@ -236,6 +268,9 @@ class AndroidLoginManager:
         await self._sleep(1)
         await self._hide_keyboard()
 
+        # KEYCODE_BACK may close the dialog if no keyboard was open, so check
+        # again before the password goes anywhere.
+        await self._require_password_form("输入密码前")
         await self._tap_login_resource(
             "hg_login_view_edit_text_input_password",
             fallback=self.PASSWORD_FIELD_TAP,
@@ -245,17 +280,45 @@ class AndroidLoginManager:
         await self._sleep(1)
         await self._hide_keyboard()
 
+        await self._require_password_form("点击登录前")
         await self._ensure_agreement_checked()
         await self._sleep(1)
         await self._tap_login_resource(
             "hg_login_view_button_password_login",
             fallback=self.LOGIN_BUTTON_TAP,
         )
-        await self._sleep(25)
+        await self._wait_for_login_form_closed()
+
+    async def _require_password_form(self, stage: str) -> None:
+        root, ui_xml = await self._dump_ui_tree()
+        if root is None or not self._password_form_visible(root):
+            raise AndroidLoginError(
+                f"{stage}未确认到密码登录表单，已停止自动登录（未输入凭据）",
+                output=ui_xml[-4000:],
+            )
+
+    async def _wait_for_login_form_closed(self) -> None:
+        last_ui = ""
+        for _ in range(self.LOGIN_RESULT_POLLS):
+            await self._sleep(self.LOGIN_RESULT_POLL_SECONDS)
+            root, ui_xml = await self._dump_ui_tree()
+            last_ui = ui_xml or last_ui
+            if root is None or not self._password_form_visible(root):
+                logger.info("明日方舟登录表单已关闭，视为登录提交成功")
+                return
+        raise AndroidLoginError(
+            "点击登录后登录表单仍未关闭，可能账号密码错误或需要验证",
+            output=last_ui[-4000:],
+        )
 
     async def _open_password_login_form(self) -> None:
+        """Wait for the native password form, switching from phone login if needed.
+
+        Never taps the Unity title button here: login_if_needed already did that
+        once, and the native dialog may be drawn on top of the same coordinates.
+        """
         last_ui = ""
-        for _ in range(6):
+        for _ in range(self.FORM_OPEN_POLLS):
             root, ui_xml = await self._dump_ui_tree()
             last_ui = ui_xml or last_ui
             if root is not None and self._password_form_visible(root):
@@ -269,8 +332,7 @@ class AndroidLoginManager:
                 await self._sleep(2)
                 continue
 
-            await self._tap(*self.ACCOUNT_LOGIN_TAP)
-            await self._sleep(3)
+            await self._sleep(2)
 
         root, ui_xml = await self._dump_ui_tree()
         last_ui = ui_xml or last_ui
@@ -278,7 +340,7 @@ class AndroidLoginManager:
             return
 
         raise AndroidLoginError(
-            "未能打开明日方舟密码登录表单",
+            "未能打开明日方舟密码登录表单（未输入凭据）",
             output=last_ui[-4000:],
         )
 

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from maa_tg_bot.android_login import (
+    AndroidLoginError,
     AndroidLoginManager,
     account_login_button_visible,
     png_pixel_at,
@@ -53,6 +54,7 @@ class TestLoginManager(AndroidLoginManager):
     def __init__(self, *args, **kwargs):
         ui_xmls = kwargs.pop("ui_xmls", None)
         self.title_button_visible = kwargs.pop("title_button_visible", False)
+        self.form_closes_on_login = kwargs.pop("form_closes_on_login", True)
         super().__init__(
             *args,
             sleep=self.no_sleep,
@@ -61,8 +63,13 @@ class TestLoginManager(AndroidLoginManager):
         self.shell_scripts: list[str] = []
         self.ui_xmls = list(ui_xmls or [PASSWORD_LOGIN_UI_XML])
 
-    async def _title_account_button_visible(self) -> bool:
+    async def _title_account_button_visible(self):
         return self.title_button_visible
+
+    async def _tap(self, x: int, y: int) -> None:
+        await super()._tap(x, y)
+        if self.form_closes_on_login and (x, y) in {(640, 508), (640, 498)}:
+            self.ui_xmls = [EMPTY_UI_XML]
 
     async def no_sleep(self, _seconds: float) -> None:
         return None
@@ -168,7 +175,7 @@ class AndroidLoginManagerTests(unittest.TestCase):
         self.assertEqual(runner.simple_calls, [])
         self.assertEqual(manager.shell_scripts, [])
 
-    def test_opens_password_login_form_from_title(self):
+    def test_switches_from_phone_login_to_password_form(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = test_config(Path(tmp))
             runner = FakeRunner()
@@ -181,10 +188,9 @@ class AndroidLoginManagerTests(unittest.TestCase):
             asyncio.run(manager._open_password_login_form())
 
             tap_calls = [call for call in runner.simple_calls if "tap" in call[0]]
-            self.assertEqual(tap_calls[0][0][-2:], ["640", "512"])
-            self.assertEqual(tap_calls[1][0][-2:], ["812", "562"])
+            self.assertEqual([call[0][-2:] for call in tap_calls], [["812", "562"]])
 
-    def test_accepts_password_form_after_last_account_login_tap(self):
+    def test_waits_for_password_form_without_retapping_title_button(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = test_config(Path(tmp))
             runner = FakeRunner()
@@ -197,8 +203,7 @@ class AndroidLoginManagerTests(unittest.TestCase):
             asyncio.run(manager._open_password_login_form())
 
             tap_calls = [call for call in runner.simple_calls if "tap" in call[0]]
-            self.assertEqual(len(tap_calls), 6)
-            self.assertEqual(tap_calls[-1][0][-2:], ["640", "512"])
+            self.assertEqual(tap_calls, [])
 
     def test_does_not_toggle_agreement_when_already_checked(self):
         checked_ui = PASSWORD_LOGIN_UI_XML.replace(
@@ -236,7 +241,73 @@ class AndroidLoginManagerTests(unittest.TestCase):
         self.assertTrue(logged_in)
         tap_calls = [call for call in runner.simple_calls if "tap" in call[0]]
         self.assertEqual(tap_calls[0][0][-2:], ["640", "512"])
+        self.assertEqual(sum(call[0][-2:] == ["640", "512"] for call in tap_calls), 1)
         self.assertTrue(any("doctor@example.com" in script for script in manager.shell_scripts))
+
+    def test_title_tap_scaled_to_screen_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp))
+            runner = FakeRunner()
+            manager = TestLoginManager(
+                config,
+                runner.run_simple,
+                ui_xmls=[EMPTY_UI_XML, PASSWORD_LOGIN_UI_XML],
+                title_button_visible=(1920, 1080),
+            )
+
+            asyncio.run(manager.login_if_needed())
+
+        tap_calls = [call for call in runner.simple_calls if "tap" in call[0]]
+        self.assertEqual(tap_calls[0][0][-2:], ["960", "768"])
+
+    def test_never_types_credentials_when_form_does_not_appear(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp))
+            runner = FakeRunner()
+            manager = TestLoginManager(
+                config,
+                runner.run_simple,
+                ui_xmls=[EMPTY_UI_XML],
+                title_button_visible=True,
+            )
+
+            with self.assertRaises(AndroidLoginError):
+                asyncio.run(manager.login_if_needed())
+
+        self.assertEqual(manager.shell_scripts, [])
+        tap_calls = [call for call in runner.simple_calls if "tap" in call[0]]
+        self.assertEqual([call[0][-2:] for call in tap_calls], [["640", "512"]])
+
+    def test_stops_before_password_when_form_closes_after_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp))
+            runner = FakeRunner()
+            # open form, confirm before account, tap account; then the form is gone
+            manager = TestLoginManager(
+                config,
+                runner.run_simple,
+                ui_xmls=[PASSWORD_LOGIN_UI_XML] * 3 + [EMPTY_UI_XML],
+            )
+
+            with self.assertRaises(AndroidLoginError):
+                asyncio.run(manager._perform_official_login())
+
+        self.assertTrue(any("doctor@example.com" in script for script in manager.shell_scripts))
+        self.assertFalse(any("password123" in script for script in manager.shell_scripts))
+
+    def test_raises_when_login_form_stays_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp))
+            runner = FakeRunner()
+            manager = TestLoginManager(
+                config,
+                runner.run_simple,
+                ui_xmls=[PASSWORD_LOGIN_UI_XML],
+                form_closes_on_login=False,
+            )
+
+            with self.assertRaises(AndroidLoginError):
+                asyncio.run(manager.login_if_needed())
 
     def test_account_login_button_requires_title_screen_colors(self):
         def pixel_at(x: int, y: int) -> tuple[int, int, int]:
@@ -247,6 +318,21 @@ class AndroidLoginManagerTests(unittest.TestCase):
 
         self.assertTrue(account_login_button_visible(1280, 720, pixel_at))
         self.assertFalse(account_login_button_visible(1920, 1080, pixel_at))
+        self.assertFalse(account_login_button_visible(1280, 1024, pixel_at))
+
+        def scaled_pixel(x: int, y: int) -> tuple[int, int, int]:
+            if 840 - 120 <= x <= 840 + 120 and 768 - 36 <= y <= 768 + 36 and abs(x - 960) <= 140:
+                return (90, 90, 92)
+            return (225, 228, 230)
+
+        self.assertTrue(account_login_button_visible(1920, 1080, scaled_pixel))
+
+        def one_noisy_sample(x: int, y: int) -> tuple[int, int, int]:
+            if (x, y) == (400, 513):
+                return (150, 120, 100)
+            return pixel_at(x, y)
+
+        self.assertTrue(account_login_button_visible(1280, 720, one_noisy_sample))
 
         def wrong_pixel(_x: int, _y: int) -> tuple[int, int, int]:
             return (20, 20, 20)
