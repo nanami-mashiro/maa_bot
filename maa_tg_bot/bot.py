@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import logging.handlers
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import BotCommand, Update
+from telegram.error import NetworkError
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 from .auth import is_authorized
@@ -20,6 +22,9 @@ from .task_queue import TaskQueue
 
 logger = logging.getLogger(__name__)
 SCHEDULER_TASK_KEY = "daily_scheduler_task"
+BOT_LOG_MAX_BYTES = 10 * 1024 * 1024
+BOT_LOG_BACKUP_COUNT = 5
+NOTIFY_RETRY_DELAYS = (5.0, 30.0)
 
 
 TASK_KIND_LABELS = {
@@ -129,7 +134,17 @@ def build_application(config: AppConfig) -> Application:
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("closegame", closegame_command))
     application.add_handler(CommandHandler("stop", stop_command))
+    application.add_error_handler(error_handler)
     return application
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = context.error
+    if isinstance(error, NetworkError):
+        # 轮询期间代理/网络抖动很常见，PTB 会自动重试；只记一行，避免整屏堆栈刷爆日志。
+        logger.warning("Telegram 网络错误（将自动重试）：%s", error)
+        return
+    logger.error("处理 Telegram 更新时出现异常", exc_info=error)
 
 
 async def set_public_commands(application: Application) -> None:
@@ -146,7 +161,12 @@ def setup_logging(log_dir: Path) -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(log_dir / "bot.log", encoding="utf-8"),
+            logging.handlers.RotatingFileHandler(
+                log_dir / "bot.log",
+                maxBytes=BOT_LOG_MAX_BYTES,
+                backupCount=BOT_LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            ),
         ],
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -416,7 +436,11 @@ async def send_task_result_to_bot(
     chat_id: int,
     result: TaskResult,
 ) -> None:
-    await finalize_task_result(application, result)
+    try:
+        await finalize_task_result(application, result)
+    except Exception as exc:
+        logger.exception("任务 %s 收尾（关闭游戏）失败", result.request.id)
+        result.message += f"\n任务收尾（关闭游戏）异常：{exc}"
     summary = (
         f"{task_kind_label(result.request.kind)} {task_state_label(result.state)}\n"
         f"任务 ID：{result.request.id}\n"
@@ -430,10 +454,28 @@ async def send_task_result_to_bot(
     if result.output_tail and result.state != TaskState.SUCCEEDED:
         summary += f"\n\n日志尾部：\n{tail_text(result.output_tail, 1500)}"
     if result.artifact_path and result.artifact_path.exists():
-        with result.artifact_path.open("rb") as file:
-            await bot.send_photo(chat_id=chat_id, photo=file, caption=summary[:1024])
+        artifact_path = result.artifact_path
+
+        async def send_photo() -> None:
+            with artifact_path.open("rb") as file:
+                await bot.send_photo(chat_id=chat_id, photo=file, caption=summary[:1024])
+
+        await send_with_retry(send_photo)
         return
-    await bot.send_message(chat_id=chat_id, text=summary[:3900])
+    await send_with_retry(lambda: bot.send_message(chat_id=chat_id, text=summary[:3900]))
+
+
+async def send_with_retry(send, delays: tuple[float, ...] | None = None):
+    """Retry a Telegram send on transient network errors (proxy hiccups, timeouts)."""
+    delays = NOTIFY_RETRY_DELAYS if delays is None else delays
+    for attempt, delay in enumerate((*delays, None), start=1):
+        try:
+            return await send()
+        except NetworkError as exc:
+            if delay is None:
+                raise
+            logger.warning("Telegram 发送失败（第 %s 次），%.0f 秒后重试：%s", attempt, delay, exc)
+            await asyncio.sleep(delay)
 
 
 async def finalize_task_result(application: Application, result: TaskResult) -> None:
@@ -593,10 +635,15 @@ async def queue_scheduled_daily(application: Application) -> bool:
         )
         return False
 
-    await application.bot.send_message(
-        chat_id=chat_id,
-        text=f"已排队定时日常任务 {request.id}。队列位置：{position}。",
-    )
+    logger.info("已排队定时日常任务 %s，队列位置 %s", request.id, position)
+    try:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=f"已排队定时日常任务 {request.id}。队列位置：{position}。",
+        )
+    except Exception:
+        # 任务已经入队并会照常执行，只是“已排队”提示没发出去。
+        logger.warning("定时日常 %s 已排队，但发送排队通知失败", request.id, exc_info=True)
     return True
 
 
@@ -667,4 +714,6 @@ def main() -> None:
     setup_logging(config.bot.log_dir)
     logger.info("启动 maa-tg-bot")
     application = build_application(config)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # bootstrap_retries=-1：启动时 Telegram/代理暂不可达就一直重试，而不是直接退出进程
+    # 让容器反复重启（之前代理断开时一晚上重启了几十次）。
+    application.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=-1)

@@ -17,6 +17,15 @@ if "telegram" not in sys.modules:
     telegram_module.Update = object
     sys.modules["telegram"] = telegram_module
 
+if "telegram.error" not in sys.modules:
+    telegram_error_module = types.ModuleType("telegram.error")
+
+    class FakeNetworkError(Exception):
+        pass
+
+    telegram_error_module.NetworkError = FakeNetworkError
+    sys.modules["telegram.error"] = telegram_error_module
+
 if "telegram.ext" not in sys.modules:
     telegram_ext_module = types.ModuleType("telegram.ext")
     telegram_ext_module.Application = object
@@ -39,6 +48,7 @@ from maa_tg_bot.bot import (
     setstage_command,
     screenshot_command,
     send_task_result_to_bot,
+    send_with_retry,
     set_public_commands,
     status_command,
 )
@@ -46,6 +56,7 @@ from maa_tg_bot.config import load_config
 from maa_tg_bot.maa_cli import ProcessResult
 from maa_tg_bot.models import QueueSnapshot, TaskKind, TaskRequest, TaskResult, TaskState
 from maa_tg_bot.state import BotStateStore
+from telegram.error import NetworkError
 
 
 DAILY_SUMMARY = """\
@@ -726,6 +737,85 @@ class BotCommandTests(unittest.TestCase):
 
         self.assertFalse(queued)
         self.assertIn("定时日常已跳过：任务队列已满。", messages[0][1])
+
+    def test_queue_scheduled_daily_still_queued_when_notice_fails(self):
+        class BrokenBot(FakeBot):
+            async def send_message(self, chat_id: int, text: str) -> None:
+                raise NetworkError("proxy down")
+
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                store = BotStateStore(Path(tmp) / "bot-state.sqlite")
+                queue = RecordingQueue()
+                application = FakeApplication(
+                    {
+                        "config": test_config_with_schedule(),
+                        "state_store": store,
+                        "task_queue": queue,
+                        "executor": FakeExecutor(),
+                    }
+                )
+                application.bot = BrokenBot()
+                try:
+                    queued = await queue_scheduled_daily(application)
+                finally:
+                    store.close()
+                return queued, queue.requests
+
+        with self.assertLogs("maa_tg_bot.bot", level="WARNING"):
+            queued, requests = asyncio.run(scenario())
+
+        self.assertTrue(queued)
+        self.assertEqual(len(requests), 1)
+
+    def test_send_with_retry_retries_network_errors_then_succeeds(self):
+        attempts = []
+
+        async def flaky():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise NetworkError("timed out")
+            return "sent"
+
+        with self.assertLogs("maa_tg_bot.bot", level="WARNING"):
+            result = asyncio.run(send_with_retry(flaky, delays=(0, 0)))
+
+        self.assertEqual(result, "sent")
+        self.assertEqual(len(attempts), 3)
+
+    def test_send_with_retry_gives_up_after_last_attempt(self):
+        async def always_fail():
+            raise NetworkError("down")
+
+        with self.assertLogs("maa_tg_bot.bot", level="WARNING"):
+            with self.assertRaises(NetworkError):
+                asyncio.run(send_with_retry(always_fail, delays=(0,)))
+
+    def test_send_task_result_still_sends_when_finalize_raises(self):
+        class ExplodingExecutor(FakeExecutor):
+            async def close_game(self):
+                raise RuntimeError("adb gone")
+
+        async def scenario():
+            application = FakeApplication({"executor": ExplodingExecutor()})
+            now = datetime.now(UTC)
+            request = TaskRequest(kind=TaskKind.DAILY, requested_by=0, chat_id=456, id="d1")
+            result = TaskResult(
+                request=request,
+                state=TaskState.SUCCEEDED,
+                started_at=now,
+                finished_at=now,
+                exit_code=0,
+                message="ok",
+            )
+            await send_task_result_to_bot(application.bot, application, 456, result)
+            return application.bot.messages
+
+        with self.assertLogs("maa_tg_bot.bot", level="ERROR"):
+            messages = asyncio.run(scenario())
+
+        self.assertEqual(len(messages), 1)
+        self.assertIn("任务收尾（关闭游戏）异常：adb gone", messages[0][1])
 
     def test_next_daily_run_uses_next_configured_time(self):
         now = datetime(2026, 5, 26, 8, 30, tzinfo=UTC)
