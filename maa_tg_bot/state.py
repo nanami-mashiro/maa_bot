@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -90,8 +92,19 @@ class BotStateStore:
         updated_at = str(data.get("updated_at", "")).strip() or self._now()
         self._put_setting(FIGHT_STAGE_KEY, stage, updated_at=updated_at)
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path)
+    def close(self) -> None:
+        """Connections are opened per operation and always closed; nothing to release."""
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        # sqlite3.Connection 的 with 只负责提交/回滚，不会关闭连接；
+        # 未关闭的连接会一直占着文件句柄（Windows 上导致数据库文件无法删除）。
+        connection = sqlite3.connect(self.path)
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _get_setting(self, key: str) -> tuple[str, str]:
         with self._connect() as connection:
