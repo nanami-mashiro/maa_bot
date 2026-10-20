@@ -132,7 +132,7 @@ docker compose exec maa-bot adb -s 127.0.0.1:5555 get-state
 enabled = true
 ```
 
-也可以在 `.env` 中设置 `ARKNIGHTS_LOGIN_ENABLED=true`。然后在 `.env` 中填写 `ARKNIGHTS_LOGIN_USERNAME` 和 `ARKNIGHTS_LOGIN_PASSWORD`。Bot 会先用 MAA 的 `StartUp` 单独启动游戏；启动失败会关闭游戏并按 `[maa].startup_retries` 重试。自动登录器只在后续 MAA 任务失败且当前界面明确是官服登录页时，才输入账号密码并重试一次。该自动登录器只适配当前 redroid 的 1280x720 官服登录页；遇到验证码、安全验证、错误密码或页面变化时会失败退出，不会尝试绕过验证。
+也可以在 `.env` 中设置 `ARKNIGHTS_LOGIN_ENABLED=true`。然后在 `.env` 中填写 `ARKNIGHTS_LOGIN_USERNAME` 和 `ARKNIGHTS_LOGIN_PASSWORD`。Bot 会先用 MAA 的 `StartUp` 单独启动游戏；启动失败会关闭游戏并按 `[maa].startup_retries` 重试。若当前画面是官服登录表单，或 1280x720 标题页上的「账号登录」按钮，会先自动输入账号密码，再重试一次启动。自动登录器也会在后续 MAA 任务失败且当前界面明确是官服登录页时再试一次。该自动登录器只适配当前 redroid 的 1280x720 官服登录页；遇到验证码、安全验证、错误密码或页面变化时会失败退出，不会尝试绕过验证。
 
 如果游戏客户端强制更新导致 `StartUp` 失败，Bot 会在日志包含疑似客户端过期信号时，从官服下载 APK 并通过 `adb install -r` 安装，然后重试一次启动。该行为由 `[client_update]` 控制；安装成功后会删除 `$MAA_CONFIG_DIR/cache/arknights-official.apk`，安装失败时会保留该文件方便排查。
 

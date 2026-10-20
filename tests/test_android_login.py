@@ -4,7 +4,11 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 
-from maa_tg_bot.android_login import AndroidLoginManager
+from maa_tg_bot.android_login import (
+    AndroidLoginManager,
+    account_login_button_visible,
+    png_pixel_at,
+)
 from maa_tg_bot.config import load_config
 
 
@@ -48,6 +52,7 @@ class FakeRunner:
 class TestLoginManager(AndroidLoginManager):
     def __init__(self, *args, **kwargs):
         ui_xmls = kwargs.pop("ui_xmls", None)
+        self.title_button_visible = kwargs.pop("title_button_visible", False)
         super().__init__(
             *args,
             sleep=self.no_sleep,
@@ -55,6 +60,9 @@ class TestLoginManager(AndroidLoginManager):
         )
         self.shell_scripts: list[str] = []
         self.ui_xmls = list(ui_xmls or [PASSWORD_LOGIN_UI_XML])
+
+    async def _title_account_button_visible(self) -> bool:
+        return self.title_button_visible
 
     async def no_sleep(self, _seconds: float) -> None:
         return None
@@ -122,8 +130,19 @@ class AndroidLoginManagerTests(unittest.TestCase):
         self.assertIn("351", tap_calls[-3][0])
         self.assertIn("449", tap_calls[-2][0])
         self.assertIn("640", tap_calls[-1][0])
+        commands = [call[0] for call in runner.simple_calls]
+        back_indexes = [index for index, command in enumerate(commands) if "KEYCODE_BACK" in command]
+        password_index = next(index for index, command in enumerate(commands) if "351" in command)
+        self.assertGreaterEqual(len(back_indexes), 2)
+        self.assertLess(back_indexes[0], password_index)
         self.assertTrue(any("doctor@example.com" in script for script in manager.shell_scripts))
         self.assertTrue(any("password123" in script for script in manager.shell_scripts))
+        self.assertTrue(
+            any(
+                "KEYCODE_MOVE_END" in script and "while" not in script
+                for script in manager.shell_scripts
+            )
+        )
 
     def test_does_not_login_when_feature_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -180,6 +199,85 @@ class AndroidLoginManagerTests(unittest.TestCase):
             tap_calls = [call for call in runner.simple_calls if "tap" in call[0]]
             self.assertEqual(len(tap_calls), 6)
             self.assertEqual(tap_calls[-1][0][-2:], ["640", "512"])
+
+    def test_does_not_toggle_agreement_when_already_checked(self):
+        checked_ui = PASSWORD_LOGIN_UI_XML.replace(
+            'hg_login_view_check_box_check_agreement" bounds="[431,399][468,436]"',
+            'hg_login_view_check_box_check_agreement" checked="true" bounds="[431,399][468,436]"',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp))
+            runner = FakeRunner()
+            manager = TestLoginManager(
+                config,
+                runner.run_simple,
+                ui_xmls=[checked_ui],
+            )
+
+            logged_in = asyncio.run(manager.login_if_needed())
+
+        self.assertTrue(logged_in)
+        tap_calls = [call for call in runner.simple_calls if "tap" in call[0]]
+        self.assertFalse(any("449" in call[0] for call in tap_calls))
+
+    def test_logs_in_from_unity_title_account_button(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp))
+            runner = FakeRunner()
+            manager = TestLoginManager(
+                config,
+                runner.run_simple,
+                ui_xmls=[EMPTY_UI_XML, PASSWORD_LOGIN_UI_XML],
+                title_button_visible=True,
+            )
+
+            logged_in = asyncio.run(manager.login_if_needed())
+
+        self.assertTrue(logged_in)
+        tap_calls = [call for call in runner.simple_calls if "tap" in call[0]]
+        self.assertEqual(tap_calls[0][0][-2:], ["640", "512"])
+        self.assertTrue(any("doctor@example.com" in script for script in manager.shell_scripts))
+
+    def test_account_login_button_requires_title_screen_colors(self):
+        def pixel_at(x: int, y: int) -> tuple[int, int, int]:
+            button = {(640, 512), (560, 513), (720, 513), (640, 490), (640, 536)}
+            if (x, y) in button:
+                return (85, 85, 85)
+            return (230, 230, 230)
+
+        self.assertTrue(account_login_button_visible(1280, 720, pixel_at))
+        self.assertFalse(account_login_button_visible(1920, 1080, pixel_at))
+
+        def wrong_pixel(_x: int, _y: int) -> tuple[int, int, int]:
+            return (20, 20, 20)
+
+        self.assertFalse(account_login_button_visible(1280, 720, wrong_pixel))
+
+    def test_png_pixel_at_reads_rgb_pixels(self):
+        png = _rgb_png(2, 1, {(0, 0): (85, 86, 87), (1, 0): (230, 231, 232)})
+        width, height, pixel_at = png_pixel_at(png)
+
+        self.assertEqual((width, height), (2, 1))
+        self.assertEqual(pixel_at(0, 0), (85, 86, 87))
+        self.assertEqual(pixel_at(1, 0), (230, 231, 232))
+
+
+def _rgb_png(width: int, height: int, pixels: dict[tuple[int, int], tuple[int, int, int]]) -> bytes:
+    import struct
+    import zlib
+
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)
+        for x in range(width):
+            raw.extend(pixels[(x, y)])
+    compressed = zlib.compress(bytes(raw))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", compressed) + chunk(b"IEND", b"")
 
 
 if __name__ == "__main__":

@@ -470,9 +470,10 @@ Error: Some error occurred during running task!
                     "MAA_STARTUP_RETRIES": "3",
                 },
             )
+            login_manager = FakeLoginManager()
             executor = TestExecutor(
                 env_config,
-                FakeLoginManager(),
+                login_manager,
                 process_results=[
                     ProcessResult(exit_code=1, output="startup failed 1"),
                     ProcessResult(exit_code=1, output="startup failed 2"),
@@ -493,6 +494,7 @@ Error: Some error occurred during running task!
         self.assertIn("启动游戏失败，已重试 3 次", result.message)
         self.assertIn("tg_daily_abc123_startup_3.log", result.message)
         self.assertEqual(result.output_tail, "startup failed 3")
+        self.assertEqual(login_manager.calls, 3)
         self.assertEqual(
             [call[0][-2] for call in executor.process_calls],
             [
@@ -501,6 +503,57 @@ Error: Some error occurred during running task!
                 "tg_daily_abc123_startup_3",
             ],
         )
+
+    def test_startup_failure_on_login_screen_logs_in_and_retries_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_config = load_config(
+                path=Path("/tmp/nonexistent-maa-tg-bot.toml"),
+                env={
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "TELEGRAM_ALLOWED_USER_IDS": "123",
+                    "MAA_CONFIG_DIR": str(Path(tmp) / "maa-config"),
+                    "BOT_LOG_DIR": str(Path(tmp) / "logs"),
+                    "MAA_AUTO_STARTUP": "true",
+                    "MAA_STARTUP_RETRIES": "3",
+                },
+            )
+            login_manager = FakeLoginManager(login_attempted=True)
+            executor = TestExecutor(
+                env_config,
+                login_manager,
+                process_results=[
+                    ProcessResult(exit_code=1, output="startup failed"),
+                    ProcessResult(exit_code=0, output="startup ok after login"),
+                    ProcessResult(exit_code=0, output="main ok"),
+                ],
+            )
+            request = TaskRequest(
+                kind=TaskKind.FIGHT,
+                requested_by=1,
+                chat_id=1,
+                options={"stage": "1-7"},
+                id="abc123",
+            )
+
+            result = asyncio.run(executor.run(request))
+
+        self.assertEqual(result.state, TaskState.SUCCEEDED)
+        self.assertEqual(login_manager.calls, 1)
+        self.assertIn("已自动登录并重试启动", result.message)
+        self.assertEqual(
+            [call[0][-2] for call in executor.process_calls],
+            [
+                "tg_fight_abc123_startup_1",
+                "tg_fight_abc123_startup_after_login",
+                "tg_fight_abc123",
+            ],
+        )
+        force_stop_calls = [
+            call
+            for call, _timeout in executor.simple_calls
+            if call[-3:] == ["am", "force-stop", "com.hypergryph.arknights"]
+        ]
+        self.assertEqual(force_stop_calls, [])
 
     def test_startup_gate_client_update_failure_installs_apk_and_retries_startup(self):
         with tempfile.TemporaryDirectory() as tmp:

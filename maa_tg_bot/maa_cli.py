@@ -33,6 +33,7 @@ class StartupGateResult:
     attempts: int
     task_path: Path
     log_path: Path
+    recovered_login: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,8 +100,10 @@ class MaaCliExecutor:
             await self.ensure_adb()
             task_name = f"tg_{request.kind.value}_{request.id}"
             recovered_client_update = False
+            recovered_login = False
             if self.config.maa.auto_startup:
                 startup = await self._run_startup_gate(task_name, request)
+                recovered_login = startup.recovered_login
                 if startup.result.cancelled:
                     raise TaskStopRequested
                 if startup.result.exit_code != 0:
@@ -129,13 +132,16 @@ class MaaCliExecutor:
                         startup = recovery.startup
                         recovered_client_update = startup.result.exit_code == 0
                     if startup.result.exit_code != 0:
+                        message = self._startup_failure_message(startup)
+                        if recovered_login:
+                            message = f"已尝试自动登录，但启动仍然失败。{message}"
                         return TaskResult(
                             request=request,
                             state=TaskState.FAILED,
                             started_at=started_at,
                             finished_at=datetime.now(UTC),
                             exit_code=startup.result.exit_code,
-                            message=self._startup_failure_message(startup),
+                            message=message,
                             output_tail=tail_text(startup.result.output),
                         )
             self._raise_if_stop_requested()
@@ -178,6 +184,8 @@ class MaaCliExecutor:
                 message = self._task_message(result, task_path, log_path)
             if recovered_client_update:
                 message = f"已自动更新客户端并重试启动。{message}"
+            if recovered_login:
+                message = f"已自动登录并重试启动。{message}"
             if retried_after_login:
                 message = f"已自动登录并重试。{message}"
             return TaskResult(
@@ -343,29 +351,52 @@ class MaaCliExecutor:
     ) -> StartupGateResult:
         attempts = max(1, self.config.maa.startup_retries)
         last: StartupGateResult | None = None
+        recovered_login = False
         for attempt in range(1, attempts + 1):
             self._raise_if_stop_requested()
-            startup_task_name = f"{task_name}_startup_{attempt}"
-            task_path = self._write_task_doc(
-                startup_task_name,
-                self.builder.build_startup(request.options),
-            )
-            log_path = self._log_path(startup_task_name)
             logger.info("启动游戏尝试 %s/%s", attempt, attempts)
-            result = await self._run_process(
-                self._maa_command(["run", startup_task_name, "--batch"]),
-                timeout=self.config.maa.task_timeout_seconds,
-                log_path=log_path,
+            last = await self._run_startup_attempt(
+                request,
+                f"{task_name}_startup_{attempt}",
+                attempt,
             )
-            last = StartupGateResult(
-                result=result,
-                attempts=attempt,
-                task_path=task_path,
-                log_path=log_path,
+            if last.result.cancelled or last.result.exit_code == 0:
+                return StartupGateResult(
+                    result=last.result,
+                    attempts=last.attempts,
+                    task_path=last.task_path,
+                    log_path=last.log_path,
+                    recovered_login=recovered_login,
+                )
+            logger.warning(
+                "启动游戏尝试 %s/%s 失败，退出码=%s",
+                attempt,
+                attempts,
+                last.result.exit_code,
             )
-            if result.cancelled or result.exit_code == 0:
-                return last
-            logger.warning("启动游戏尝试 %s/%s 失败，退出码=%s", attempt, attempts, result.exit_code)
+            if not recovered_login:
+                logged_in = await self.login_manager.login_if_needed()
+                if logged_in:
+                    recovered_login = True
+                    self._raise_if_stop_requested()
+                    logger.info("已自动登录，重试启动游戏")
+                    last = await self._run_startup_attempt(
+                        request,
+                        f"{task_name}_startup_after_login",
+                        attempt,
+                    )
+                    if last.result.cancelled or last.result.exit_code == 0:
+                        return StartupGateResult(
+                            result=last.result,
+                            attempts=last.attempts,
+                            task_path=last.task_path,
+                            log_path=last.log_path,
+                            recovered_login=True,
+                        )
+                    logger.warning(
+                        "自动登录后启动游戏仍然失败，退出码=%s",
+                        last.result.exit_code,
+                    )
             if attempt < attempts:
                 close_result = await self.close_game()
                 if close_result.exit_code != 0:
@@ -376,7 +407,37 @@ class MaaCliExecutor:
                     )
         if last is None:
             raise RuntimeError("启动游戏重试次数配置异常")
-        return last
+        return StartupGateResult(
+            result=last.result,
+            attempts=last.attempts,
+            task_path=last.task_path,
+            log_path=last.log_path,
+            recovered_login=recovered_login,
+        )
+
+    async def _run_startup_attempt(
+        self,
+        request: TaskRequest,
+        startup_task_name: str,
+        attempt: int,
+    ) -> StartupGateResult:
+        task_path = self._write_task_doc(
+            startup_task_name,
+            self.builder.build_startup(request.options),
+        )
+        log_path = self._log_path(startup_task_name)
+        logger.info("启动游戏：%s", startup_task_name)
+        result = await self._run_process(
+            self._maa_command(["run", startup_task_name, "--batch"]),
+            timeout=self.config.maa.task_timeout_seconds,
+            log_path=log_path,
+        )
+        return StartupGateResult(
+            result=result,
+            attempts=attempt,
+            task_path=task_path,
+            log_path=log_path,
+        )
 
     async def _try_client_update_recovery(
         self,
