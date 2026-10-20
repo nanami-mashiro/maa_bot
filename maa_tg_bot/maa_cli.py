@@ -638,6 +638,22 @@ class MaaCliExecutor:
         return env
 
     @staticmethod
+    async def _wait_for_returncode(
+        process: asyncio.subprocess.Process,
+        timeout: float,
+        *,
+        poll_interval: float = 0.1,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while process.returncode is None:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(poll_interval, remaining))
+        return True
+
+    @staticmethod
     async def _drain_until_exit(
         process: asyncio.subprocess.Process,
         timeout: int,
@@ -665,13 +681,14 @@ class MaaCliExecutor:
 
         drain_task = asyncio.create_task(_drain())
         timed_out = False
-        try:
-            await asyncio.wait_for(process.wait(), timeout=timeout)
-        except TimeoutError:
+        # asyncio's Process.wait() only resolves after every pipe hits EOF, so a grandchild
+        # that inherited stdout (e.g. a forked adb server) would block it. Poll the
+        # returncode instead: it is set as soon as the tracked process itself exits.
+        if not await MaaCliExecutor._wait_for_returncode(process, timeout):
             timed_out = True
-            process.kill()
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(process.wait(), timeout=10)
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await MaaCliExecutor._wait_for_returncode(process, 10)
         # Process has exited / been killed. Let the drain flush briefly, then stop waiting
         # even if a grandchild still holds the pipe open.
         try:
