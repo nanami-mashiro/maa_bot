@@ -572,9 +572,9 @@ Error: Some error occurred during running task!
                 env_config,
                 FakeLoginManager(),
                 process_results=[
-                    ProcessResult(exit_code=1, output="GameOffline"),
-                    ProcessResult(exit_code=1, output="GameOffline"),
-                    ProcessResult(exit_code=1, output="GameOffline"),
+                    ProcessResult(exit_code=1, output="客户端版本过低，请更新"),
+                    ProcessResult(exit_code=1, output="客户端版本过低，请更新"),
+                    ProcessResult(exit_code=1, output="客户端版本过低，请更新"),
                     ProcessResult(exit_code=0, output="startup ok after apk"),
                     ProcessResult(exit_code=0, output="main ok"),
                 ],
@@ -639,6 +639,40 @@ Error: Some error occurred during running task!
         self.assertEqual(executor.download_calls, 0)
         self.assertEqual(executor.install_calls, 0)
 
+    def test_game_offline_is_not_treated_as_outdated_client(self):
+        self.assertFalse(
+            MaaCliExecutor._looks_like_client_update_required(
+                "[INFO ] StartUp Start\n[WARN ] GameOffline\n[ERROR] StartUp Error"
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            env_config = load_config(
+                path=Path("/tmp/nonexistent-maa-tg-bot.toml"),
+                env={
+                    "TELEGRAM_BOT_TOKEN": "token",
+                    "TELEGRAM_ALLOWED_USER_IDS": "123",
+                    "MAA_CONFIG_DIR": str(Path(tmp) / "maa-config"),
+                    "BOT_LOG_DIR": str(Path(tmp) / "logs"),
+                    "MAA_AUTO_STARTUP": "true",
+                    "MAA_STARTUP_RETRIES": "2",
+                },
+            )
+            executor = ClientUpdatingTestExecutor(
+                env_config,
+                FakeLoginManager(),
+                process_results=[
+                    ProcessResult(exit_code=1, output="[WARN ] GameOffline"),
+                    ProcessResult(exit_code=1, output="[WARN ] GameOffline"),
+                ],
+            )
+            request = TaskRequest(kind=TaskKind.DAILY, requested_by=1, chat_id=1, id="abc123")
+
+            result = asyncio.run(executor.run(request))
+
+        self.assertEqual(result.state, TaskState.FAILED)
+        self.assertEqual(executor.download_calls, 0)
+        self.assertEqual(executor.install_calls, 0)
+
     def test_client_update_download_failure_returns_clear_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             env_config = load_config(
@@ -656,9 +690,9 @@ Error: Some error occurred during running task!
                 env_config,
                 FakeLoginManager(),
                 process_results=[
-                    ProcessResult(exit_code=1, output="GameOffline"),
-                    ProcessResult(exit_code=1, output="GameOffline"),
-                    ProcessResult(exit_code=1, output="GameOffline"),
+                    ProcessResult(exit_code=1, output="客户端版本过低，请更新"),
+                    ProcessResult(exit_code=1, output="客户端版本过低，请更新"),
+                    ProcessResult(exit_code=1, output="客户端版本过低，请更新"),
                 ],
                 download_result=ProcessResult(exit_code=22, output="curl failed"),
             )
@@ -695,9 +729,9 @@ Error: Some error occurred during running task!
                 env_config,
                 FakeLoginManager(),
                 process_results=[
-                    ProcessResult(exit_code=1, output="GameOffline"),
-                    ProcessResult(exit_code=1, output="GameOffline"),
-                    ProcessResult(exit_code=1, output="GameOffline"),
+                    ProcessResult(exit_code=1, output="客户端版本过低，请更新"),
+                    ProcessResult(exit_code=1, output="客户端版本过低，请更新"),
+                    ProcessResult(exit_code=1, output="客户端版本过低，请更新"),
                 ],
                 install_result=ProcessResult(exit_code=1, output="install failed"),
             )
@@ -733,9 +767,9 @@ Error: Some error occurred during running task!
                 env_config,
                 FakeLoginManager(),
                 process_results=[
-                    ProcessResult(exit_code=1, output="GameOffline"),
-                    ProcessResult(exit_code=1, output="GameOffline"),
-                    ProcessResult(exit_code=1, output="GameOffline"),
+                    ProcessResult(exit_code=1, output="客户端版本过低，请更新"),
+                    ProcessResult(exit_code=1, output="客户端版本过低，请更新"),
+                    ProcessResult(exit_code=1, output="客户端版本过低，请更新"),
                     ProcessResult(exit_code=0, output="startup ok after apk"),
                     ProcessResult(exit_code=0, output="main ok"),
                 ],

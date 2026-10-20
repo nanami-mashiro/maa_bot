@@ -43,8 +43,9 @@ class ClientUpdateRecovery:
     failure_result: ProcessResult | None = None
 
 
+# MAA 的 GameOffline 表示游戏掉线/未登录（如账号被顶下线），不代表客户端过期，
+# 不能据此触发 APK 下载重装；掉线由自动登录流程处理。
 CLIENT_UPDATE_REQUIRED_PATTERNS = (
-    "GameOffline",
     "ClientVersion",
     "client version",
     "version update",
