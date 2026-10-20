@@ -23,6 +23,7 @@ class TaskState(str, Enum):
 
 
 NotifyCallback = Callable[["TaskResult"], Awaitable[None]]
+ProgressCallback = Callable[[str], Awaitable[None]]
 
 
 @dataclass
@@ -32,6 +33,8 @@ class TaskRequest:
     chat_id: int
     options: dict[str, Any] = field(default_factory=dict)
     notify: NotifyCallback | None = None
+    # Mid-task status messages (e.g. waiting for a game resource update).
+    progress: ProgressCallback | None = None
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 

@@ -148,6 +148,8 @@ enabled = true
 
 如果游戏客户端强制更新导致 `StartUp` 失败，Bot 会在日志包含疑似客户端过期信号时，从官服下载 APK 并通过 `adb install -r` 安装，然后重试一次启动。该行为由 `[client_update]` 控制；安装成功后会删除 `$MAA_CONFIG_DIR/cache/arknights-official.apk`，安装失败时会保留该文件方便排查。
 
+启动前和 `StartUp`/任务失败后，Bot 会截图识别游戏画面（Unity 画面，按像素识别）并自愈：资源更新卡在「更新下载失败 错误号:207」或出现「与神经网络连接丢失（错误号:0）」时，执行 `am force-stop` + 结束残留进程 + 重新启动游戏，下载会从已下载的部分继续；画面是资源更新进度条时会等待下载完成（默认最长 6 小时，进度 15 分钟无变化就重开，单次任务最多重开 6 次），并通过 Telegram 发送开始等待、每次重开、更新完成的提示。从不清除游戏数据/缓存。该行为由 `[recovery]`（或 `GAME_RECOVERY_*` 环境变量）控制。
+
 MaaCore 和 MAA 资源可静默自动更新。默认 compose 部署会在每次非截图 MAA 任务前按间隔执行 `maa update --batch --test-time 0 stable`，由 `[maa_update]` 或环境变量 `MAA_CORE_UPDATE_*` 控制；更新失败只写日志并继续执行当前任务，避免 GitHub 网络抖动阻塞日常。
 
 ## Bot 命令

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from maa_tg_bot.android_login import AndroidLoginError
 from maa_tg_bot.config import load_config
+from maa_tg_bot.game_recovery import GameRecoveryError, RecoveryReport
 from maa_tg_bot.maa_cli import MaaCliExecutor, ProcessResult
 from maa_tg_bot.models import TaskKind, TaskRequest, TaskState
 
@@ -42,6 +43,25 @@ class FakeLoginManager:
         return self.login_attempted
 
 
+class FakeGameRecovery:
+    """Never touches a real device; returns scripted RecoveryReports or raises."""
+
+    def __init__(self, reports=None):
+        self.reports = list(reports or [])
+        self.calls = 0
+
+    async def recover(self, notify=None, *, stop_check=None):
+        self.calls += 1
+        if self.reports:
+            item = self.reports.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            if notify is not None and not isinstance(item, Exception) and item.acted:
+                await notify("progress")
+            return item
+        return RecoveryReport()
+
+
 class TestExecutor(MaaCliExecutor):
     def __init__(
         self,
@@ -49,8 +69,13 @@ class TestExecutor(MaaCliExecutor):
         login_manager,
         process_results=None,
         simple_results=None,
+        game_recovery=None,
     ):
-        super().__init__(config, login_manager=login_manager)
+        super().__init__(
+            config,
+            login_manager=login_manager,
+            game_recovery=game_recovery or FakeGameRecovery(),
+        )
         self.process_results = list(process_results or [ProcessResult(exit_code=0, output="ok")])
         self.simple_results = list(simple_results or [])
         self.process_calls = []
@@ -901,6 +926,145 @@ Error: Some error occurred during running task!
         self.assertEqual(len(executor.simple_calls), 1)
 
 
+class GameRecoveryHookTests(unittest.TestCase):
+    def _config(self, tmp):
+        return load_config(
+            path=Path("/tmp/nonexistent-maa-tg-bot.toml"),
+            env={
+                "TELEGRAM_BOT_TOKEN": "token",
+                "TELEGRAM_ALLOWED_USER_IDS": "123",
+                "MAA_CONFIG_DIR": str(Path(tmp) / "maa-config"),
+                "BOT_LOG_DIR": str(Path(tmp) / "logs"),
+                "MAA_AUTO_STARTUP": "true",
+                "MAA_STARTUP_RETRIES": "3",
+            },
+        )
+
+    def _request(self, progress=None):
+        return TaskRequest(
+            kind=TaskKind.DAILY, requested_by=1, chat_id=1, id="abc123", progress=progress
+        )
+
+    def test_recovery_runs_before_startup_and_is_quiet_when_nothing_wrong(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recovery = FakeGameRecovery()
+            executor = TestExecutor(
+                self._config(tmp),
+                FakeLoginManager(),
+                process_results=[
+                    ProcessResult(exit_code=0, output="startup ok"),
+                    ProcessResult(exit_code=0, output="main ok"),
+                ],
+                game_recovery=recovery,
+            )
+            result = asyncio.run(executor.run(self._request()))
+
+        self.assertEqual(result.state, TaskState.SUCCEEDED)
+        self.assertEqual(recovery.calls, 1)
+        self.assertNotIn("游戏自愈", result.message)
+
+    def test_startup_failure_recovers_game_and_retries_immediately(self):
+        sent = []
+
+        async def progress(text):
+            sent.append(text)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            login = FakeLoginManager()
+            recovery = FakeGameRecovery(
+                [RecoveryReport(), RecoveryReport(relaunches=1, waited_update=True, update_seconds=600)]
+            )
+            executor = TestExecutor(
+                self._config(tmp),
+                login,
+                process_results=[
+                    ProcessResult(exit_code=1, output="GameOffline"),
+                    ProcessResult(exit_code=0, output="startup ok"),
+                    ProcessResult(exit_code=0, output="main ok"),
+                ],
+                game_recovery=recovery,
+            )
+            result = asyncio.run(executor.run(self._request(progress)))
+
+        self.assertEqual(result.state, TaskState.SUCCEEDED)
+        self.assertEqual(
+            [call[0][-2] for call in executor.process_calls],
+            [
+                "tg_daily_abc123_startup_1",
+                "tg_daily_abc123_startup_1_recovered",
+                "tg_daily_abc123",
+            ],
+        )
+        self.assertEqual(login.calls, 0)
+        self.assertEqual(sent, ["progress"])
+        self.assertIn("等待游戏资源更新约 10 分钟", result.message)
+        self.assertIn("自动重开游戏 1 次", result.message)
+
+    def test_progress_notify_failure_does_not_fail_task(self):
+        async def broken(_text):
+            raise RuntimeError("telegram down")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = TestExecutor(
+                self._config(tmp),
+                FakeLoginManager(),
+                process_results=[
+                    ProcessResult(exit_code=0, output="startup ok"),
+                    ProcessResult(exit_code=0, output="main ok"),
+                ],
+                game_recovery=FakeGameRecovery([RecoveryReport(relaunches=1)]),
+            )
+            result = asyncio.run(executor.run(self._request(broken)))
+
+        self.assertEqual(result.state, TaskState.SUCCEEDED)
+
+    def test_recovery_error_fails_task_with_clear_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = TestExecutor(
+                self._config(tmp),
+                FakeLoginManager(),
+                process_results=[],
+                game_recovery=FakeGameRecovery([GameRecoveryError("资源更新等待超时")]),
+            )
+            result = asyncio.run(executor.run(self._request()))
+
+        self.assertEqual(result.state, TaskState.FAILED)
+        self.assertIn("游戏自愈失败：资源更新等待超时", result.message)
+        self.assertEqual(executor.process_calls, [])
+
+    def test_main_task_failure_recovers_restarts_and_retries_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            login = FakeLoginManager()
+            recovery = FakeGameRecovery(
+                [RecoveryReport(), RecoveryReport(relaunches=1), RecoveryReport()]
+            )
+            executor = TestExecutor(
+                self._config(tmp),
+                login,
+                process_results=[
+                    ProcessResult(exit_code=0, output="startup ok"),
+                    ProcessResult(exit_code=1, output="network lost"),
+                    ProcessResult(exit_code=0, output="startup ok again"),
+                    ProcessResult(exit_code=0, output="main ok"),
+                ],
+                game_recovery=recovery,
+            )
+            result = asyncio.run(executor.run(self._request()))
+
+        self.assertEqual(result.state, TaskState.SUCCEEDED)
+        self.assertEqual(
+            [call[0][-2] for call in executor.process_calls],
+            [
+                "tg_daily_abc123_startup_1",
+                "tg_daily_abc123",
+                "tg_daily_abc123_recovered_startup_1",
+                "tg_daily_abc123",
+            ],
+        )
+        self.assertEqual(login.calls, 0)
+        self.assertIn("自动重开游戏 1 次", result.message)
+
+
 class DrainUntilExitTests(unittest.TestCase):
     @staticmethod
     async def _spawn(*args):
@@ -952,7 +1116,11 @@ class DrainUntilExitTests(unittest.TestCase):
 class EnsureAdbReadyTests(unittest.TestCase):
     class ReadyExecutor(MaaCliExecutor):
         def __init__(self, config, boot_outputs):
-            super().__init__(config, login_manager=FakeLoginManager())
+            super().__init__(
+                config,
+                login_manager=FakeLoginManager(),
+                game_recovery=FakeGameRecovery(),
+            )
             self.boot_outputs = list(boot_outputs)
             self.simple_calls = []
             self.sleeps = []

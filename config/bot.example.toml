@@ -40,6 +40,15 @@ interval_seconds = 21600
 timeout_seconds = 1800
 test_time = 0
 
+[recovery]
+# 游戏内资源更新卡在「错误号:207」、或弹出「与神经网络连接丢失（错误号:0）」时，
+# 自动 force-stop 并重开游戏；正在更新资源时等它下完再启动。不会清除游戏数据。
+enabled = true
+update_timeout_seconds = 21600   # 最长等待资源更新 6 小时
+poll_seconds = 120               # 更新期间每 2 分钟截图检查一次
+stall_seconds = 900              # 进度 15 分钟没变化就重开游戏
+max_relaunches = 6               # 单次任务最多自动重开次数
+
 [android]
 adb_bin = "adb"
 adb_serial = "redroid:5555"

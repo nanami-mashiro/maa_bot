@@ -411,7 +411,14 @@ async def enqueue_task(
     async def notify(result: TaskResult) -> None:
         await send_task_result(context, chat_id, result)
 
-    request = TaskRequest(kind=kind, requested_by=user_id, chat_id=chat_id, options=options, notify=notify)
+    request = TaskRequest(
+        kind=kind,
+        requested_by=user_id,
+        chat_id=chat_id,
+        options=options,
+        notify=notify,
+        progress=progress_sender(context.bot, chat_id),
+    )
     try:
         position = await queue.enqueue(request)
     except asyncio.QueueFull:
@@ -463,6 +470,18 @@ async def send_task_result_to_bot(
         await send_with_retry(send_photo)
         return
     await send_with_retry(lambda: bot.send_message(chat_id=chat_id, text=summary[:3900]))
+
+
+def progress_sender(bot, chat_id: int):
+    """Mid-task status messages; failures are logged, never raised into the task."""
+
+    async def send(text: str) -> None:
+        try:
+            await send_with_retry(lambda: bot.send_message(chat_id=chat_id, text=text[:3900]))
+        except Exception:
+            logger.warning("任务进度通知发送失败：%s", text, exc_info=True)
+
+    return send
 
 
 async def send_with_retry(send, delays: tuple[float, ...] | None = None):
@@ -625,6 +644,7 @@ async def queue_scheduled_daily(application: Application) -> bool:
         chat_id=chat_id,
         options={"stage": stage},
         notify=notify,
+        progress=progress_sender(application.bot, chat_id),
     )
     try:
         position = await queue.enqueue(request)

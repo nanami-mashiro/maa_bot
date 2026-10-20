@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .android_login import AndroidLoginError, AndroidLoginManager
 from .config import AppConfig
+from .game_recovery import GameRecovery, GameRecoveryError, RecoveryReport
 from .maa_summary import parse_maa_summary
 from .models import TaskKind, TaskRequest, TaskResult, TaskState
 from .task_builder import MaaTaskBuilder
@@ -34,6 +35,7 @@ class StartupGateResult:
     task_path: Path
     log_path: Path
     recovered_login: bool = False
+    recovered_game: bool = False
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,7 @@ class MaaCliExecutor:
         self,
         config: AppConfig,
         login_manager: AndroidLoginManager | None = None,
+        game_recovery: GameRecovery | None = None,
     ):
         self.config = config
         self.builder = MaaTaskBuilder(config)
@@ -92,12 +95,54 @@ class MaaCliExecutor:
             config,
             self._run_simple,
         )
+        self.game_recovery = game_recovery or GameRecovery(
+            config,
+            self._run_simple,
+            sleep=self._interruptible_sleep,
+        )
+        self._recovery_notes: list[str] = []
+
+    async def _interruptible_sleep(self, seconds: float) -> None:
+        """Sleep that wakes up early on /stop (the caller then checks the stop flag)."""
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+
+    async def _recover_game(self, request: TaskRequest, stage: str) -> RecoveryReport:
+        """Heal stuck update/network dialogs; never lets a notify failure escape."""
+
+        async def progress(text: str) -> None:
+            if request.progress is None:
+                return
+            try:
+                await request.progress(text)
+            except Exception:
+                logger.warning("任务进度通知发送失败：%s", text, exc_info=True)
+
+        report = await self.game_recovery.recover(
+            progress,
+            stop_check=self._raise_if_stop_requested,
+        )
+        if report.acted:
+            logger.info(
+                "游戏自愈（%s）：重开 %s 次，等待资源更新=%s",
+                stage,
+                report.relaunches,
+                report.waited_update,
+            )
+            parts = []
+            if report.waited_update:
+                parts.append(f"等待游戏资源更新约 {max(1, round(report.update_seconds / 60))} 分钟")
+            if report.relaunches:
+                parts.append(f"自动重开游戏 {report.relaunches} 次")
+            self._recovery_notes.append("、".join(parts))
+        return report
 
     async def run(self, request: TaskRequest) -> TaskResult:
         started_at = datetime.now(UTC)
         if request.kind == TaskKind.SCREENSHOT:
             return await self._run_screenshot(request, started_at)
 
+        self._recovery_notes = []
         try:
             self._stop_requested = False
             self._stop_event.clear()
@@ -138,6 +183,8 @@ class MaaCliExecutor:
                         recovered_client_update = startup.result.exit_code == 0
                     if startup.result.exit_code != 0:
                         message = self._startup_failure_message(startup)
+                        if self._recovery_notes:
+                            message = f"游戏自愈：{'；'.join(self._recovery_notes)}。{message}"
                         if recovered_login:
                             message = f"已尝试自动登录，但启动仍然失败。{message}"
                         return TaskResult(
@@ -160,6 +207,26 @@ class MaaCliExecutor:
             )
             retried_after_login = False
             tolerated_daily_errors = self._tolerated_daily_error_labels(request, result)
+            if (
+                result.exit_code != 0
+                and not result.cancelled
+                and not tolerated_daily_errors
+                and self.config.maa.auto_startup
+            ):
+                # 例如任务中途弹出「与神经网络连接丢失」：重开游戏、重新唤醒后再跑一次。
+                report = await self._recover_game(request, "任务失败后")
+                if report.acted:
+                    restart = await self._run_startup_gate(f"{task_name}_recovered", request)
+                    if restart.result.cancelled:
+                        raise TaskStopRequested
+                    if restart.result.exit_code == 0:
+                        log_path = self._log_path(f"{task_name}_recovered_retry")
+                        result = await self._run_process(
+                            command,
+                            timeout=self.config.maa.task_timeout_seconds,
+                            log_path=log_path,
+                        )
+                        tolerated_daily_errors = self._tolerated_daily_error_labels(request, result)
             if result.exit_code != 0 and not result.cancelled and not tolerated_daily_errors:
                 login_attempted = await self.login_manager.login_if_needed()
                 if login_attempted:
@@ -193,6 +260,8 @@ class MaaCliExecutor:
                 message = f"已自动登录并重试启动。{message}"
             if retried_after_login:
                 message = f"已自动登录并重试。{message}"
+            if self._recovery_notes:
+                message = f"游戏自愈：{'；'.join(self._recovery_notes)}。{message}"
             return TaskResult(
                 request=request,
                 state=state,
@@ -209,6 +278,14 @@ class MaaCliExecutor:
                 started_at=started_at,
                 finished_at=datetime.now(UTC),
                 message="任务已取消。",
+            )
+        except GameRecoveryError as exc:
+            return TaskResult(
+                request=request,
+                state=TaskState.FAILED,
+                started_at=started_at,
+                finished_at=datetime.now(UTC),
+                message=f"游戏自愈失败：{exc}",
             )
         except AndroidLoginError as exc:
             return TaskResult(
@@ -357,6 +434,8 @@ class MaaCliExecutor:
         attempts = max(1, self.config.maa.startup_retries)
         last: StartupGateResult | None = None
         recovered_login = False
+        # 启动前先处理卡住的更新/掉线弹窗，正在更新资源时等它下完。
+        await self._recover_game(request, "启动前")
         for attempt in range(1, attempts + 1):
             self._raise_if_stop_requested()
             logger.info("启动游戏尝试 %s/%s", attempt, attempts)
@@ -379,6 +458,26 @@ class MaaCliExecutor:
                 attempts,
                 last.result.exit_code,
             )
+            # StartUp 可能因为游戏开始更新资源、卡在 207 或「连接丢失」弹窗而失败：
+            # 先自愈（等更新/重开游戏），成功后立刻再试一次。
+            report = await self._recover_game(request, f"启动失败 {attempt}/{attempts} 后")
+            if report.acted:
+                self._raise_if_stop_requested()
+                last = await self._run_startup_attempt(
+                    request,
+                    f"{task_name}_startup_{attempt}_recovered",
+                    attempt,
+                )
+                if last.result.cancelled or last.result.exit_code == 0:
+                    return StartupGateResult(
+                        result=last.result,
+                        attempts=last.attempts,
+                        task_path=last.task_path,
+                        log_path=last.log_path,
+                        recovered_login=recovered_login,
+                        recovered_game=True,
+                    )
+                logger.warning("游戏自愈后启动仍然失败，退出码=%s", last.result.exit_code)
             if not recovered_login:
                 logged_in = await self.login_manager.login_if_needed()
                 if logged_in:

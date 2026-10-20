@@ -180,6 +180,20 @@ class MaaCoreUpdateConfig:
 
 
 @dataclass(frozen=True)
+class GameRecoveryConfig:
+    """Self-healing for stuck resource updates / network-lost dialogs (see game_recovery)."""
+
+    enabled: bool = True
+    update_timeout_seconds: int = 6 * 3600
+    poll_seconds: int = 120
+    stall_seconds: int = 900
+    max_relaunches: int = 6
+    relaunch_wait_seconds: int = 45
+    settle_checks: int = 3
+    settle_seconds: int = 20
+
+
+@dataclass(frozen=True)
 class AndroidConfig:
     adb_bin: str = "adb"
     adb_serial: str = "redroid:5555"
@@ -279,6 +293,7 @@ class AppConfig:
     client_update: ClientUpdateConfig = field(default_factory=ClientUpdateConfig)
     maa_update: MaaCoreUpdateConfig = field(default_factory=MaaCoreUpdateConfig)
     android: AndroidConfig = field(default_factory=AndroidConfig)
+    recovery: GameRecoveryConfig = field(default_factory=GameRecoveryConfig)
     login: LoginConfig = field(default_factory=LoginConfig)
     fight: FightConfig = field(default_factory=FightConfig)
     base: BaseConfig = field(default_factory=BaseConfig)
@@ -316,6 +331,7 @@ def load_config(path: Path | None = None, env: dict[str, str] | None = None) -> 
     client_update = _section(raw, "client_update")
     maa_update = _section(raw, "maa_update")
     android = _section(raw, "android")
+    recovery = _section(raw, "recovery")
     login = _section(raw, "login")
     fight = _section(raw, "fight")
     base = _section(raw, "base")
@@ -443,6 +459,28 @@ def load_config(path: Path | None = None, env: dict[str, str] | None = None) -> 
                 _env_first(env, "SCREENSHOT_TIMEOUT_SECONDS")
                 or android.get("screenshot_timeout_seconds", 30)
             ),
+        ),
+        recovery=GameRecoveryConfig(
+            enabled=_as_bool(
+                _env_first(env, "GAME_RECOVERY_ENABLED"),
+                _as_bool(recovery.get("enabled"), True),
+            ),
+            update_timeout_seconds=int(
+                _env_first(env, "GAME_RECOVERY_UPDATE_TIMEOUT_SECONDS")
+                or recovery.get("update_timeout_seconds", 6 * 3600)
+            ),
+            poll_seconds=int(
+                _env_first(env, "GAME_RECOVERY_POLL_SECONDS") or recovery.get("poll_seconds", 120)
+            ),
+            stall_seconds=int(
+                _env_first(env, "GAME_RECOVERY_STALL_SECONDS") or recovery.get("stall_seconds", 900)
+            ),
+            max_relaunches=int(
+                _env_first(env, "GAME_RECOVERY_MAX_RELAUNCHES") or recovery.get("max_relaunches", 6)
+            ),
+            relaunch_wait_seconds=int(recovery.get("relaunch_wait_seconds", 45)),
+            settle_checks=max(1, int(recovery.get("settle_checks", 3))),
+            settle_seconds=int(recovery.get("settle_seconds", 20)),
         ),
         login=LoginConfig(
             enabled=login_enabled,
