@@ -159,6 +159,32 @@ def classify_png(png: bytes) -> ScreenState:
     return classify_screen(width, height, pixel_at)
 
 
+DAILY_RESET_UTC_OFFSET_HOURS = 8
+DAILY_RESET_HOUR = 4
+CLOCK_TICKS_PER_SECOND = 100
+
+
+def last_daily_reset_epoch(now: float) -> float:
+    """Epoch seconds of the most recent 04:00 UTC+8 server reset at or before now."""
+    shift = (DAILY_RESET_UTC_OFFSET_HOURS - DAILY_RESET_HOUR) * 3600
+    return ((int(now) + shift) // 86400) * 86400 - shift
+
+
+def parse_process_start_epoch(output: str) -> tuple[float | None, float | None]:
+    """Parse ``cat /proc/PID/stat /proc/uptime; date +%s`` into (start epoch, now)."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return None, None
+    try:
+        stat_fields = lines[0].rsplit(")", 1)[1].split()
+        start_ticks = int(stat_fields[19])  # field 22 of /proc/PID/stat
+        uptime = float(lines[1].split()[0])
+        now = float(lines[2])
+    except (IndexError, ValueError):
+        return None, None
+    return now - uptime + start_ticks / CLOCK_TICKS_PER_SECOND, now
+
+
 class GameRecoveryError(RuntimeError):
     pass
 
@@ -323,17 +349,70 @@ class GameRecovery:
             pids = await self._game_pids(package)
             if pids:
                 raise GameRecoveryError(f"无法结束残留的游戏进程：{' '.join(pids)}")
+        await self.launch_game()
+
+    async def launch_game(self) -> None:
+        """Start the game and make sure a process actually appears.
+
+        ``am start -n <launcher activity>`` first: on redroid ``monkey`` aborts
+        with "SYS_KEYS has no physical keys" yet exits 0 without starting the
+        game, so monkey is only a fallback.
+        """
+        package = self.config.login.package_name
+        attempts: list[str] = []
+        activity = await self._launch_activity(package)
+        if activity:
+            started = await self._adb_shell(["am", "start", "-n", activity], timeout=30)
+            attempts.append(started.output.strip()[-200:])
+            if started.exit_code == 0 and "Error" not in started.output and await self._wait_for_game_pid(package):
+                return
         result = await self._adb_shell(
             ["monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"],
             timeout=30,
         )
-        if result.exit_code != 0 or "No activities found" in result.output:
-            activity = await self._launch_activity(package)
-            if not activity:
-                raise GameRecoveryError(f"重开游戏失败：{result.output.strip()[-300:]}")
-            started = await self._adb_shell(["am", "start", "-n", activity], timeout=30)
-            if started.exit_code != 0:
-                raise GameRecoveryError(f"重开游戏失败：{started.output.strip()[-300:]}")
+        attempts.append(result.output.strip()[-200:])
+        if await self._wait_for_game_pid(package):
+            return
+        raise GameRecoveryError(f"重开游戏失败：{' | '.join(a for a in attempts if a)[-300:]}")
+
+    async def _wait_for_game_pid(self, package: str, checks: int = 5) -> bool:
+        for _ in range(checks):
+            await self._sleep(2)
+            if await self._game_pids(package):
+                return True
+        return False
+
+    async def restart_if_open_across_reset(self) -> bool:
+        """Relaunch the game when it has been running since before the last daily reset.
+
+        The CN server resets at 04:00 (UTC+8). A game left open across it shows
+        「数据文件已过期，请重新登录」 at the first server call, so every MAA task
+        fails with GameOffline. Returns True when it relaunched.
+        """
+        package = self.config.login.package_name
+        pids = await self._game_pids(package)
+        if not pids:
+            return False
+        started_at, now = await self._process_start_epoch(pids[0])
+        if started_at is None or now is None:
+            return False
+        last_reset = last_daily_reset_epoch(now)
+        if started_at >= last_reset:
+            return False
+        logger.warning(
+            "游戏进程 %s 启动于上一次 04:00 数据刷新之前（%.1f 小时前），先重开游戏",
+            pids[0],
+            (now - started_at) / 3600,
+        )
+        await self.relaunch_game()
+        await self._sleep(self.settings.relaunch_wait_seconds)
+        return True
+
+    async def _process_start_epoch(self, pid: str) -> tuple[float | None, float | None]:
+        result = await self._adb_shell(
+            ["cat", f"/proc/{pid}/stat", "/proc/uptime", ";", "date", "+%s"], timeout=10
+        )
+        return parse_process_start_epoch(result.output) if result.exit_code == 0 else (None, None)
 
     async def _game_pids(self, package: str) -> list[str]:
         result = await self._adb_shell(["pidof", package], timeout=10)

@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import struct
+import time
 import zlib
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Protocol
@@ -30,6 +31,14 @@ class AndroidLoginError(RuntimeError):
     def __init__(self, message: str, output: str = ""):
         super().__init__(message)
         self.output = output
+
+
+class LoginFormNotOpenedError(AndroidLoginError):
+    """The native password form never appeared; nothing was typed."""
+
+
+TITLE_STATE_START = "start"
+TITLE_STATE_ACCOUNT = "account"
 
 
 SleepFunc = Callable[[float], Awaitable[None]]
@@ -85,6 +94,49 @@ def account_login_button_visible(width: int, height: int, pixel_at: PixelAt) -> 
         and button_hits >= len(TITLE_BUTTON_POINTS) - 1
         and background_hits >= len(TITLE_BACKGROUND_POINTS) - 1
     )
+
+
+# Logged-in title screen: a yellow diamond 「START」 button at the bottom center
+# on a black strip, while the background artwork rotates. Rows stop above the
+# update progress bar (y=694..696) so the yellow bar never counts.
+START_DIAMOND_BOX = (590, 650, 690, 690)  # left, top, right, bottom
+START_FLANK_BOXES = ((420, 650, 540, 690), (740, 650, 860, 690))
+START_MIN_YELLOW = 60
+
+
+def _is_start_yellow(pixel: tuple[int, int, int]) -> bool:
+    red, green, blue = pixel
+    return red >= 200 and 170 <= green <= 235 and blue <= 70
+
+
+def start_title_visible(width: int, height: int, pixel_at: PixelAt) -> bool:
+    """Recognize the logged-in title screen (yellow 「START」 diamond, saved session).
+
+    Tapping it enters the game without any login form, so it must never be
+    mistaken for the logged-out 「账号登录」 title button.
+    """
+    if not _ratio_ok(width, height):
+        return False
+
+    def sample(box: tuple[int, int, int, int], step: int):
+        left, top, right, bottom = box
+        for ref_y in range(top, bottom + 1, step):
+            for ref_x in range(left, right + 1, step):
+                x, y = scale_point((ref_x, ref_y), width, height)
+                if 0 <= x < width and 0 <= y < height:
+                    yield pixel_at(x, y)
+
+    yellow = sum(_is_start_yellow(pixel) for pixel in sample(START_DIAMOND_BOX, 2))
+    if yellow < START_MIN_YELLOW:
+        return False
+    flank_yellow = 0
+    flank_dark = flank_total = 0
+    for box in START_FLANK_BOXES:
+        for pixel in sample(box, 8):
+            flank_total += 1
+            flank_yellow += _is_start_yellow(pixel)
+            flank_dark += max(pixel) <= 40
+    return flank_yellow == 0 and flank_total > 0 and flank_dark >= 0.8 * flank_total
 
 
 # Text lines (white glyphs) inside the one-button dialog band, measured on the
@@ -368,6 +420,7 @@ class AndroidLoginManager:
     FORM_OPEN_POLLS = 10
     TITLE_AFTER_EXPIRED_POLLS = 36
     TITLE_AFTER_EXPIRED_POLL_SECONDS = 5
+    TITLE_CONFIRM_SECONDS = 3
     LOGIN_RESULT_POLLS = 8
     LOGIN_RESULT_POLL_SECONDS = 5
 
@@ -383,7 +436,15 @@ class AndroidLoginManager:
         self._sleep = sleep
 
     async def login_if_needed(self) -> bool:
-        """Log in when the native login form or the logged-out title button is visible.
+        """Get the game past login-related screens; True means "state changed, StartUp again".
+
+        * Native password form visible: log in.
+        * 「数据文件已过期，请重新登录」 (normally the daily 04:00 server reset while
+          the game stayed open): confirm it, then wait for the title screen. If the
+          title shows the yellow START diamond the saved session is still valid and
+          MAA StartUp can enter the game, so no credentials are needed.
+        * Logged-out title with the 「账号登录」 button (seen on two captures in a
+          row): tap it once and log in.
 
         Credentials are only typed after uiautomator confirms the native password
         form (account + password inputs). If the form never shows up, this raises
@@ -402,14 +463,21 @@ class AndroidLoginManager:
             tap_x, tap_y = scale_point(DATA_EXPIRED_CONFIRM_TAP, width, height)
             logger.info("检测到「数据文件已过期，请重新登录」提示，点击确认 (%s,%s)", tap_x, tap_y)
             await self._tap(tap_x, tap_y)
-            screen_size = await self._wait_for_title_account_button()
-            if not screen_size:
+            state, screen_size = await self._wait_for_title_after_expired()
+            if state == TITLE_STATE_START:
+                logger.info("已回到标题页且显示 START（登录状态仍有效），交给 MAA StartUp 进入游戏")
+                return True
+            if state != TITLE_STATE_ACCOUNT:
+                await self._save_debug_screenshot("login_title_timeout")
                 raise AndroidLoginError(
-                    "已确认「数据文件已过期」提示，但等待后仍未出现标题页账号登录按钮"
-                    "（游戏可能仍在释放资源），未输入凭据"
+                    "已确认「数据文件已过期」提示，但等待后既没有出现 START 也没有出现账号登录按钮"
+                    "（游戏可能仍在加载或释放资源），未输入凭据"
                 )
         else:
-            screen_size = await self._title_account_button_visible()
+            if await self._start_title_visible():
+                # Saved session; MAA StartUp taps START itself.
+                return False
+            screen_size = await self._confirmed_title_account_button()
             if not screen_size:
                 return False
 
@@ -420,8 +488,47 @@ class AndroidLoginManager:
         # could land on whatever the login dialog draws there.
         await self._tap(tap_x, tap_y)
         await self._sleep(3)
-        await self._login_with_timeout()
+        try:
+            await self._login_with_timeout()
+        except LoginFormNotOpenedError:
+            if await self._title_account_button_visible():
+                await self._save_debug_screenshot("login_form_missing")
+                raise
+            # The tap left the title screen without any login form: the game
+            # went in with its saved session. Let StartUp take it from here.
+            logger.warning("点击标题页后没有出现登录表单，游戏已离开标题页（视为登录状态有效），交给 StartUp")
+            return True
         return True
+
+    async def _confirmed_title_account_button(self) -> tuple[int, int] | bool | None:
+        """The logged-out title button, seen on two captures a few seconds apart.
+
+        A single frame is not enough: transition and loading frames can briefly
+        look like the gray button on a light background.
+        """
+        first = await self._title_account_button_visible()
+        if not first:
+            return None
+        await self._sleep(self.TITLE_CONFIRM_SECONDS)
+        if await self._start_title_visible():
+            return None
+        second = await self._title_account_button_visible()
+        return second or None
+
+    async def _wait_for_title_after_expired(self) -> tuple[str | None, tuple[int, int] | bool | None]:
+        account_hits = 0
+        for _ in range(self.TITLE_AFTER_EXPIRED_POLLS):
+            await self._sleep(self.TITLE_AFTER_EXPIRED_POLL_SECONDS)
+            if await self._start_title_visible():
+                return TITLE_STATE_START, None
+            screen_size = await self._title_account_button_visible()
+            if screen_size:
+                account_hits += 1
+                if account_hits >= 2:
+                    return TITLE_STATE_ACCOUNT, screen_size
+            else:
+                account_hits = 0
+        return None, None
 
     async def _login_with_timeout(self) -> None:
         try:
@@ -431,14 +538,6 @@ class AndroidLoginManager:
             )
         except TimeoutError as exc:
             raise AndroidLoginError("明日方舟自动登录超时") from exc
-
-    async def _wait_for_title_account_button(self) -> tuple[int, int] | bool | None:
-        for _ in range(self.TITLE_AFTER_EXPIRED_POLLS):
-            await self._sleep(self.TITLE_AFTER_EXPIRED_POLL_SECONDS)
-            screen_size = await self._title_account_button_visible()
-            if screen_size:
-                return screen_size
-        return None
 
     async def _data_expired_dialog_visible(self) -> tuple[int, int] | None:
         """Return the screen size when the 「数据文件已过期」 dialog is visible, else None."""
@@ -467,6 +566,32 @@ class AndroidLoginManager:
         if account_login_button_visible(width, height, pixel_at):
             return (width, height)
         return None
+
+    async def _start_title_visible(self) -> bool:
+        """True when the logged-in title screen (START diamond) is visible."""
+        png = await self._capture_png()
+        if not png:
+            return False
+        try:
+            width, height, pixel_at = png_pixel_at(png)
+        except (ValueError, zlib.error, struct.error) as exc:
+            logger.warning("解析截图失败，跳过 START 标题页识别：%s", exc)
+            return False
+        return start_title_visible(width, height, pixel_at)
+
+    async def _save_debug_screenshot(self, tag: str) -> None:
+        """Keep the screen of a failed login in the log dir for later diagnosis."""
+        try:
+            png = await self._capture_png()
+            if not png:
+                return
+            log_dir = self.config.bot.log_dir
+            log_dir.mkdir(parents=True, exist_ok=True)
+            path = log_dir / f"{tag}_{time.strftime('%Y%m%d_%H%M%S')}.png"
+            path.write_bytes(png)
+            logger.warning("已保存登录失败截图：%s", path)
+        except Exception:
+            logger.warning("保存登录失败截图失败", exc_info=True)
 
     async def _capture_png(self) -> bytes:
         return await adb_screencap_png(self.config.android.adb_bin, self.config.android.adb_serial)
@@ -555,7 +680,7 @@ class AndroidLoginManager:
         if root is not None and self._password_form_visible(root):
             return
 
-        raise AndroidLoginError(
+        raise LoginFormNotOpenedError(
             "未能打开明日方舟密码登录表单（未输入凭据）",
             output=last_ui[-4000:],
         )

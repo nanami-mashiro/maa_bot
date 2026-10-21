@@ -159,8 +159,10 @@ def recovery_config(**env):
 
 
 class ScriptedRecovery(GameRecovery):
-    def __init__(self, states, *, pidof=None, config=None, monkey_result=None):
+    def __init__(self, states, *, pidof=None, config=None, monkey_result=None, am_start_launches=True):
         self.clock = FakeClock()
+        self.launched = False
+        self.am_start_launches = am_start_launches
         self.commands = []
         self.states = list(states)
         self.pidof = list(pidof or [])
@@ -184,9 +186,18 @@ class ScriptedRecovery(GameRecovery):
         args = list(command[4:])
         self.commands.append(args)
         if args[0] == "pidof":
-            pids = self.pidof.pop(0) if self.pidof else ""
+            if self.pidof:
+                pids = self.pidof.pop(0)
+            else:
+                pids = "4242" if self.launched else ""
             return Result(0 if pids else 1, pids)
+        if args[:2] == ["am", "force-stop"]:
+            self.launched = False
+        if args[:2] == ["am", "start"]:
+            self.launched = self.am_start_launches
         if args[0] == "monkey":
+            if self.monkey_result.exit_code == 0:
+                self.launched = True
             return self.monkey_result
         if args[:3] == ["cmd", "package", "resolve-activity"]:
             return Result(0, "priority=0\ncom.hypergryph.arknights/com.u8.sdk.U8UnityContext\n")
@@ -226,7 +237,9 @@ class RecoveryLoopTests(unittest.TestCase):
             [
                 ["am", "force-stop", "com.hypergryph.arknights"],
                 ["pidof", "com.hypergryph.arknights"],
-                ["monkey", "-p", "com.hypergryph.arknights", "-c", "android.intent.category.LAUNCHER", "1"],
+                ["cmd", "package", "resolve-activity", "--brief", "com.hypergryph.arknights"],
+                ["am", "start", "-n", "com.hypergryph.arknights/com.u8.sdk.U8UnityContext"],
+                ["pidof", "com.hypergryph.arknights"],
             ],
         )
         self.assertEqual(len(sent), 1)
@@ -251,13 +264,28 @@ class RecoveryLoopTests(unittest.TestCase):
         with self.assertRaises(GameRecoveryError):
             self.run_recover(recovery)
 
-    def test_monkey_failure_falls_back_to_am_start(self):
-        recovery = ScriptedRecovery([FAILED_207, OTHER], monkey_result=Result(1, "error"))
-        self.run_recover(recovery)
-        self.assertIn(
-            ["am", "start", "-n", "com.hypergryph.arknights/com.u8.sdk.U8UnityContext"],
-            recovery.commands,
+    def test_am_start_without_process_falls_back_to_monkey(self):
+        recovery = ScriptedRecovery([FAILED_207, OTHER], am_start_launches=False)
+        report = self.run_recover(recovery)
+        self.assertEqual(report.relaunches, 1)
+        self.assertEqual(recovery.commands[-1], ["pidof", "com.hypergryph.arknights"])
+        self.assertTrue(any(c[0] == "monkey" for c in recovery.commands))
+
+    def test_launch_that_never_starts_a_process_raises(self):
+        # redroid: monkey exits 0 ("SYS_KEYS has no physical keys") but starts nothing
+        recovery = ScriptedRecovery(
+            [FAILED_207, OTHER],
+            am_start_launches=False,
+            monkey_result=Result(0, "** SYS_KEYS has no physical keys but with factor 2.0%."),
         )
+        async def run_simple(command, timeout, _orig=recovery.run_simple):
+            result = await _orig(command, timeout)
+            if command[4] == "monkey":
+                recovery.launched = False
+            return result
+        recovery._run_simple = run_simple
+        with self.assertRaises(GameRecoveryError):
+            self.run_recover(recovery)
 
     def test_waits_for_update_with_progress_then_reports_done(self):
         sent = []
@@ -336,3 +364,63 @@ class RecoveryLoopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DailyResetTests(unittest.TestCase):
+    def test_last_daily_reset_is_0400_utc8(self):
+        from datetime import datetime, timedelta, timezone
+
+        from maa_tg_bot.game_recovery import last_daily_reset_epoch
+
+        cst = timezone(timedelta(hours=8))
+        now = datetime(2026, 10, 21, 8, 0, tzinfo=cst).timestamp()
+        self.assertEqual(last_daily_reset_epoch(now), datetime(2026, 10, 21, 4, 0, tzinfo=cst).timestamp())
+        early = datetime(2026, 10, 21, 3, 59, tzinfo=cst).timestamp()
+        self.assertEqual(last_daily_reset_epoch(early), datetime(2026, 10, 20, 4, 0, tzinfo=cst).timestamp())
+
+    def test_parse_process_start_epoch(self):
+        from maa_tg_bot.game_recovery import parse_process_start_epoch
+
+        stat = "32341 (com.hypergryph.arknights) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 500000 19"
+        start, now = parse_process_start_epoch(f"{stat}\n10000.50 2000.00\n1792540800\n")
+        self.assertEqual(now, 1792540800)
+        self.assertAlmostEqual(start, 1792540800 - 10000.5 + 5000)
+        self.assertEqual(parse_process_start_epoch("garbage"), (None, None))
+
+    def _recovery_with_process(self, start_offset_hours):
+        from datetime import datetime, timedelta, timezone
+
+        cst = timezone(timedelta(hours=8))
+        now = int(datetime(2026, 10, 21, 8, 0, tzinfo=cst).timestamp())
+        uptime = 100000.0
+        start = now - start_offset_hours * 3600
+        ticks = int((start - (now - uptime)) * 100)
+        fields = ["S"] + ["0"] * 18 + [str(ticks)] + ["0"]
+        stat = "4242 (com.hypergryph.arknights) " + " ".join(fields)
+        recovery = ScriptedRecovery([OTHER], pidof=["4242"])
+        recovery.launched = True
+        orig = recovery.run_simple
+
+        async def run_simple(command, timeout):
+            args = list(command[4:])
+            if args[0] == "cat":
+                recovery.commands.append(args)
+                return Result(0, f"{stat}\n{uptime} 1.0\n{now}\n")
+            return await orig(command, timeout)
+
+        recovery._run_simple = run_simple
+        return recovery
+
+    def test_game_open_since_last_night_is_relaunched(self):
+        recovery = self._recovery_with_process(start_offset_hours=8)  # started 00:00
+        self.assertTrue(asyncio.run(recovery.restart_if_open_across_reset()))
+        self.assertIn(["am", "force-stop", "com.hypergryph.arknights"], recovery.commands)
+
+    def test_game_started_after_reset_is_left_alone(self):
+        recovery = self._recovery_with_process(start_offset_hours=2)  # started 06:00
+        self.assertFalse(asyncio.run(recovery.restart_if_open_across_reset()))
+        self.assertFalse(any(c[:2] == ["am", "force-stop"] for c in recovery.commands))
+
+    def test_no_game_process_is_left_alone(self):
+        recovery = ScriptedRecovery([OTHER])
+        self.assertFalse(asyncio.run(recovery.restart_if_open_across_reset()))

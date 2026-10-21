@@ -9,6 +9,7 @@ from maa_tg_bot.android_login import (
     AndroidLoginManager,
     account_login_button_visible,
     data_expired_dialog_visible,
+    start_title_visible,
     png_pixel_at,
 )
 from maa_tg_bot.config import load_config
@@ -57,6 +58,9 @@ class TestLoginManager(AndroidLoginManager):
         self.title_button_visible = kwargs.pop("title_button_visible", False)
         self.form_closes_on_login = kwargs.pop("form_closes_on_login", True)
         self.data_expired_visible = kwargs.pop("data_expired_visible", None)
+        # list of results returned one per call (last one repeats), or a constant
+        self.start_title = kwargs.pop("start_title", False)
+        self.saved_screenshots: list[str] = []
         super().__init__(
             *args,
             sleep=self.no_sleep,
@@ -70,6 +74,14 @@ class TestLoginManager(AndroidLoginManager):
 
     async def _data_expired_dialog_visible(self):
         return self.data_expired_visible
+
+    async def _start_title_visible(self):
+        if isinstance(self.start_title, list):
+            return self.start_title.pop(0) if len(self.start_title) > 1 else self.start_title[0]
+        return self.start_title
+
+    async def _save_debug_screenshot(self, tag: str) -> None:
+        self.saved_screenshots.append(tag)
 
     async def _tap(self, x: int, y: int) -> None:
         await super()._tap(x, y)
@@ -382,6 +394,126 @@ class AndroidLoginManagerTests(unittest.TestCase):
         self.assertEqual(manager.shell_scripts, [])
         taps = [tuple(call[0][-2:]) for call in runner.simple_calls if "tap" in call[0]]
         self.assertEqual(taps, [("640", "491")])
+
+    def test_data_expired_then_start_title_needs_no_credentials(self):
+        # Daily 04:00 reset with the game left open: after confirming, the title
+        # shows START (saved session). Nothing must be typed or tapped there.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp))
+            runner = FakeRunner()
+            manager = TestLoginManager(
+                config,
+                runner.run_simple,
+                ui_xmls=[EMPTY_UI_XML],
+                title_button_visible=None,
+                data_expired_visible=(1280, 720),
+                start_title=[False, False, True],
+            )
+
+            changed = asyncio.run(manager.login_if_needed())
+
+        self.assertTrue(changed)
+        self.assertEqual(manager.shell_scripts, [])
+        taps = [tuple(call[0][-2:]) for call in runner.simple_calls if "tap" in call[0]]
+        self.assertEqual(taps, [("640", "491")])
+
+    def test_start_title_without_dialog_is_left_to_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp))
+            runner = FakeRunner()
+            manager = TestLoginManager(
+                config,
+                runner.run_simple,
+                ui_xmls=[EMPTY_UI_XML],
+                title_button_visible=True,
+                start_title=True,
+            )
+
+            changed = asyncio.run(manager.login_if_needed())
+
+        self.assertFalse(changed)
+        self.assertFalse([call for call in runner.simple_calls if "tap" in call[0]])
+
+    def test_single_frame_title_button_match_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp))
+            runner = FakeRunner()
+            manager = TestLoginManager(
+                config,
+                runner.run_simple,
+                ui_xmls=[EMPTY_UI_XML],
+            )
+            results = [(1280, 720), None]
+
+            async def flicker():
+                return results.pop(0) if results else None
+
+            manager._title_account_button_visible = flicker
+            changed = asyncio.run(manager.login_if_needed())
+
+        self.assertFalse(changed)
+        self.assertFalse([call for call in runner.simple_calls if "tap" in call[0]])
+
+    def test_title_tap_that_enters_game_without_form_is_not_a_failure(self):
+        # 2026-10-21 08:11: the title tap went straight into the game (saved
+        # session) and the password form never appeared.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp))
+            runner = FakeRunner()
+            manager = TestLoginManager(
+                config,
+                runner.run_simple,
+                ui_xmls=[EMPTY_UI_XML],
+            )
+            results = [(1280, 720), (1280, 720), None]
+
+            async def button():
+                return results.pop(0) if results else None
+
+            manager._title_account_button_visible = button
+            changed = asyncio.run(manager.login_if_needed())
+
+        self.assertTrue(changed)
+        self.assertEqual(manager.shell_scripts, [])
+
+    def test_form_missing_while_title_button_stays_saves_screenshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(Path(tmp))
+            runner = FakeRunner()
+            manager = TestLoginManager(
+                config,
+                runner.run_simple,
+                ui_xmls=[EMPTY_UI_XML],
+                title_button_visible=True,
+            )
+
+            with self.assertRaises(AndroidLoginError):
+                asyncio.run(manager.login_if_needed())
+
+        self.assertEqual(manager.saved_screenshots, ["login_form_missing"])
+
+    def test_start_title_pixel_detection(self):
+        def title(x: int, y: int) -> tuple[int, int, int]:
+            # yellow diamond outline in the START box, black strip around it
+            if 600 <= x <= 680 and 650 <= y <= 690 and (x + y) % 4 < 2:
+                return (255, 216, 0)
+            return (3, 3, 3)
+
+        self.assertTrue(start_title_visible(1280, 720, title))
+
+        def update_screen(x: int, y: int) -> tuple[int, int, int]:
+            # yellow progress bar spanning the width: not the START diamond
+            if 690 <= y <= 696:
+                return (255, 216, 0)
+            return (3, 3, 3)
+
+        self.assertFalse(start_title_visible(1280, 720, update_screen))
+
+        def wide_yellow(x: int, y: int) -> tuple[int, int, int]:
+            return (255, 216, 0) if 650 <= y <= 690 else (3, 3, 3)
+
+        self.assertFalse(start_title_visible(1280, 720, wide_yellow))
+        self.assertFalse(start_title_visible(1280, 1024, title))
 
     def test_data_expired_dialog_pixel_detection(self):
         def dialog(x: int, y: int) -> tuple[int, int, int]:

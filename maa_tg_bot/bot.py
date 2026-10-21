@@ -14,7 +14,7 @@ from telegram.ext import Application, ApplicationBuilder, CommandHandler, Contex
 
 from .auth import is_authorized
 from .config import AppConfig, load_config
-from .maa_cli import MaaCliExecutor, tail_text
+from .maa_cli import MaaCliExecutor, readable_log_tail, tail_text
 from .maa_summary import build_daily_completion_details
 from .models import TaskKind, TaskRequest, TaskResult, TaskState
 from .state import BotStateStore
@@ -459,7 +459,9 @@ async def send_task_result_to_bot(
         if detail:
             summary += f"\n\n{detail}"
     if result.output_tail and result.state != TaskState.SUCCEEDED:
-        summary += f"\n\n日志尾部：\n{tail_text(result.output_tail, 1500)}"
+        log_tail = readable_log_tail(result.output_tail)
+        if log_tail:
+            summary += f"\n\n日志尾部：\n{log_tail}"
     if result.artifact_path and result.artifact_path.exists():
         artifact_path = result.artifact_path
 

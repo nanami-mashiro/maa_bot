@@ -61,6 +61,9 @@ class FakeGameRecovery:
             return item
         return RecoveryReport()
 
+    async def restart_if_open_across_reset(self):
+        return False
+
 
 class TestExecutor(MaaCliExecutor):
     def __init__(
@@ -362,6 +365,91 @@ Error: Some error occurred during running task!
         self.assertIn("已自动登录并重试", result.message)
         self.assertIn("tg_daily_abc123_login_retry.log", result.message)
         self.assertEqual(result.output_tail, "ok after login")
+
+    def _auto_startup_config(self, tmp):
+        return load_config(
+            path=Path("/tmp/nonexistent-maa-tg-bot.toml"),
+            env={
+                "TELEGRAM_BOT_TOKEN": "token",
+                "TELEGRAM_ALLOWED_USER_IDS": "123",
+                "MAA_CONFIG_DIR": str(Path(tmp) / "maa-config"),
+                "BOT_LOG_DIR": str(Path(tmp) / "logs"),
+                "MAA_AUTO_STARTUP": "true",
+                "MAA_STARTUP_RETRIES": "1",
+            },
+        )
+
+    def test_startup_runs_again_after_login_before_retrying_tasks(self):
+        # 04:00 reset: tasks hit 「数据文件已过期」, login_if_needed confirms it and the
+        # game is back on the title screen. Retrying tasks there would only GameOffline.
+        with tempfile.TemporaryDirectory() as tmp:
+            login_manager = FakeLoginManager(login_attempted=True)
+            executor = TestExecutor(
+                self._auto_startup_config(tmp),
+                login_manager,
+                process_results=[
+                    ProcessResult(exit_code=0, output="startup ok"),
+                    ProcessResult(exit_code=1, output="GameOffline"),
+                    ProcessResult(exit_code=0, output="startup after login ok"),
+                    ProcessResult(exit_code=0, output="ok after login"),
+                ],
+            )
+            request = TaskRequest(kind=TaskKind.DAILY, requested_by=1, chat_id=1, id="abc123")
+
+            result = asyncio.run(executor.run(request))
+
+        self.assertEqual(result.state, TaskState.SUCCEEDED)
+        self.assertEqual(
+            [call[0][-2] for call in executor.process_calls],
+            [
+                "tg_daily_abc123_startup_1",
+                "tg_daily_abc123",
+                "tg_daily_abc123_startup_after_login",
+                "tg_daily_abc123",
+            ],
+        )
+
+    def test_failed_startup_after_login_skips_task_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            login_manager = FakeLoginManager(login_attempted=True)
+            executor = TestExecutor(
+                self._auto_startup_config(tmp),
+                login_manager,
+                process_results=[
+                    ProcessResult(exit_code=0, output="startup ok"),
+                    ProcessResult(exit_code=1, output="GameOffline"),
+                    ProcessResult(exit_code=1, output="startup failed"),
+                ],
+            )
+            request = TaskRequest(kind=TaskKind.DAILY, requested_by=1, chat_id=1, id="abc123")
+
+            result = asyncio.run(executor.run(request))
+
+        self.assertEqual(result.state, TaskState.FAILED)
+        self.assertEqual(len(executor.process_calls), 3)
+        self.assertEqual(result.output_tail, "startup failed")
+
+    def test_login_failure_output_has_no_ui_xml(self):
+        xml_tail = (
+            'false" selected="false" bounds="[0,0][1280,648]"><node index="0" text="" '
+            'resource-id="com.hypergryph.arknights:id/unitySurfaceView" class="android.view.View" '
+            'bounds="[0,0][1280,648]" /></node></node></hierarchy>'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            login_manager = FakeLoginManager(error=AndroidLoginError("no form", output=xml_tail))
+            executor = TestExecutor(
+                test_config(Path(tmp)),
+                login_manager,
+                process_results=[ProcessResult(exit_code=1, output="maa failed")],
+            )
+            request = TaskRequest(kind=TaskKind.DAILY, requested_by=1, chat_id=1, id="abc123")
+
+            result = asyncio.run(executor.run(request))
+
+        self.assertNotIn("bounds=", result.output_tail)
+        self.assertNotIn("<node", result.output_tail)
+        self.assertIn("unitySurfaceView", result.output_tail)
+
 
     def test_login_failure_after_maa_failure_returns_login_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1154,3 +1242,34 @@ class EnsureAdbReadyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadableLogTailTests(unittest.TestCase):
+    def test_strips_cut_off_ui_dump_and_keeps_log_lines(self):
+        from maa_tg_bot.maa_cli import readable_log_tail
+
+        text = (
+            "[2026-10-21 08:10:47 ERROR] Infrast Error\n"
+            '<?xml version=\'1.0\' encoding=\'UTF-8\'?><hierarchy rotation="0">'
+            '<node index="0" text="密码登录" resource-id="com.hypergryph.arknights:id/hg_login_view_title" '
+            'bounds="[0,0][1280,648]" /></hierarchy>\n'
+            "Error: Some error occurred during running task!"
+        )
+        tail = readable_log_tail(text)
+        self.assertNotIn("<", tail)
+        self.assertIn("Infrast Error", tail)
+        self.assertIn("界面结构已省略", tail)
+        self.assertIn("密码登录", tail)
+        self.assertTrue(tail.endswith("Error: Some error occurred during running task!"))
+
+    def test_keeps_only_last_lines(self):
+        from maa_tg_bot.maa_cli import readable_log_tail
+
+        tail = readable_log_tail("\n".join(f"line {i}" for i in range(100)), max_lines=20)
+        self.assertEqual(tail.splitlines()[0], "line 80")
+        self.assertEqual(len(readable_log_tail("x" * 5000, max_chars=1200)), 1200)
+
+    def test_plain_text_unchanged(self):
+        from maa_tg_bot.maa_cli import strip_ui_xml
+
+        self.assertEqual(strip_ui_xml("GameOffline <warn>"), "GameOffline <warn>")

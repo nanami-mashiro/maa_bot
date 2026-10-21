@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -67,6 +68,58 @@ def tail_text(value: str, max_chars: int = 4000) -> str:
     if len(value) <= max_chars:
         return value
     return value[-max_chars:]
+
+
+_UI_XML_LINE = re.compile(r"<\?xml|<hierarchy|</hierarchy>|<node\b|</node>|bounds=\"\[\d")
+_UI_XML_BLOCK = re.compile(r"<hierarchy\b.*?</hierarchy>", re.DOTALL)
+
+
+def strip_ui_xml(value: str) -> str:
+    """Replace raw uiautomator dumps (whole or cut off) with a one-line note.
+
+    A login failure used to put the end of a window dump into the Telegram
+    message, which tells the user nothing. Keep the visible texts and the short
+    resource ids instead, which is what is actually useful.
+    """
+    if not value or not _UI_XML_LINE.search(value):
+        return value
+    resource_ids: list[str] = []
+    texts: list[str] = []
+    for match in re.finditer(r'resource-id="([^"]+)"', value):
+        short = match.group(1).rsplit("/", 1)[-1]
+        if short and short not in resource_ids:
+            resource_ids.append(short)
+    for match in re.finditer(r'(?:^|\s)text="([^"]+)"', value):
+        if match.group(1).strip() and match.group(1) not in texts:
+            texts.append(match.group(1).strip())
+    parts = []
+    if texts:
+        parts.append("文字：" + "、".join(texts[:5]))
+    if resource_ids:
+        parts.append("控件：" + "、".join(resource_ids[:5]))
+    note = "[界面结构已省略" + ("；" + "；".join(parts) if parts else "") + "]"
+    cleaned = _UI_XML_BLOCK.sub("\n" + note + "\n", value)
+    lines: list[str] = []
+    for line in cleaned.splitlines():
+        if _UI_XML_LINE.search(line):
+            line = note
+        if line == note and lines and lines[-1] == note:
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def readable_log_tail(value: str, max_chars: int = 1200, max_lines: int = 20) -> str:
+    """Short, human-readable log tail for Telegram: no UI XML, last lines only."""
+    text = strip_ui_xml(value or "").strip()
+    lines = [line for line in text.splitlines() if line.strip()]
+    text = "\n".join(lines[-max_lines:])
+    if len(text) > max_chars:
+        cut = text[-(max_chars - 2) :]
+        if "\n" in cut:
+            cut = cut.split("\n", 1)[1]
+        text = "…\n" + cut
+    return text
 
 
 class TaskStopRequested(Exception):
@@ -231,12 +284,27 @@ class MaaCliExecutor:
                 login_attempted = await self.login_manager.login_if_needed()
                 if login_attempted:
                     retried_after_login = True
-                    log_path = self._log_path(f"{task_name}_login_retry")
-                    result = await self._run_process(
-                        command,
-                        timeout=self.config.maa.task_timeout_seconds,
-                        log_path=log_path,
-                    )
+                    # 登录/确认「数据文件已过期」后游戏停在标题页：先 StartUp 进到主界面，
+                    # 不然重跑的任务会在标题页上全部 GameOffline。
+                    startup_ok = True
+                    if self.config.maa.auto_startup:
+                        self._raise_if_stop_requested()
+                        restart = await self._run_startup_attempt(
+                            request, f"{task_name}_startup_after_login", 1
+                        )
+                        if restart.result.cancelled:
+                            raise TaskStopRequested
+                        startup_ok = restart.result.exit_code == 0
+                        if not startup_ok:
+                            result = restart.result
+                            log_path = restart.log_path
+                    if startup_ok:
+                        log_path = self._log_path(f"{task_name}_login_retry")
+                        result = await self._run_process(
+                            command,
+                            timeout=self.config.maa.task_timeout_seconds,
+                            log_path=log_path,
+                        )
                     tolerated_daily_errors = self._tolerated_daily_error_labels(request, result)
             state = (
                 TaskState.SUCCEEDED
@@ -294,7 +362,7 @@ class MaaCliExecutor:
                 started_at=started_at,
                 finished_at=datetime.now(UTC),
                 message=f"登录失败：{exc}",
-                output_tail=tail_text(exc.output),
+                output_tail=tail_text(strip_ui_xml(exc.output)),
             )
         except Exception as exc:
             return TaskResult(
@@ -434,6 +502,13 @@ class MaaCliExecutor:
         attempts = max(1, self.config.maa.startup_retries)
         last: StartupGateResult | None = None
         recovered_login = False
+        # 游戏从上一次任务一直开着、跨过了每日 04:00 数据刷新：先重开，避免任务中途
+        # 弹出「数据文件已过期，请重新登录」导致全部 GameOffline。
+        try:
+            if await self.game_recovery.restart_if_open_across_reset():
+                self._recovery_notes.append("游戏跨过 04:00 数据刷新，已重开")
+        except GameRecoveryError as exc:
+            logger.warning("检查/重开跨日游戏失败：%s", exc)
         # 启动前先处理卡住的更新/掉线弹窗，正在更新资源时等它下完。
         await self._recover_game(request, "启动前")
         for attempt in range(1, attempts + 1):
